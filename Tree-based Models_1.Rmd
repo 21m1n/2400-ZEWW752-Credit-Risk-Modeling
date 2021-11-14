@@ -1,0 +1,639 @@
+---
+title: "Tree-Based Models"
+author: "Zimin 417124"
+date: "6/25/2021"
+output:
+  prettydoc::html_pretty:
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+# load libraries
+library(dplyr)      # data manipulation 
+library(ggplot2)    # visualizations
+library(gridExtra)  # grid plots
+library(rsample)    # for data splitting
+library(caret)      # resampling and model training 
+
+library(rpart)      # decision tree
+library(rpart.plot) # plotting decision trees
+library(vip)        # feature importance
+library(pdp)        # feature effects 
+library(pROC)       # ROC curve
+library(ROCR)       # ROC curve
+
+library(randomForest)
+library(DALEX)
+library(shapper)
+```
+
+```{r}
+# disable scientific notation
+options(scipen = 999) 
+
+# setup customised theme 
+my_theme <- function(){
+  theme_minimal()
+}
+
+# read data
+data.raw <- read.csv("data/test.csv", stringsAsFactors = F)
+```
+
+First, we check if there exist missing values in each column. 
+
+```{r}
+# check missing values
+colSums(is.na(data.raw)) # 83 NA in Arrival.Delay.in.Minutes 
+```
+The output shows that there are 83 missing values in the column `Arrival.Delay.in.Minutes`, we use a heatmap to plot the location of the missing values in the dataframe. 
+
+```{r}
+# visualise missing data
+visdat::vis_miss(data.raw)
+```
+```{r}
+# calculate percentage of missing values
+sum(!complete.cases(data.raw$Arrival.Delay.in.Minutes))/nrow(data.raw) * 100
+```
+Since the missing values constitutes only 0.32% of the entire column, we will remove the entire rows that contain any missing values. We also remove the columns `X` - the index of the dataset and `id` - the indentifier of the survey, as they are not helpful to the modeling part.
+
+```{r}
+# remove rows that contain missing values
+data <- data.raw[complete.cases(data.raw), ]
+
+# remove X and ID 
+data <- data %>% 
+  select(-c(X, id))
+```
+
+Let's have a look at the data types of each column. Since we set `stringsAsFactors = F` while importing the dataset, all the categorical features are recognized as `characters`, we need to convert them back to `factoers`. On the other hand, all the numerical features and the survey ratings, namely `gate location`, `online boarding` have correctly encoded.
+
+```{r}
+tibble::glimpse(data)
+```
+We rename the columns by replacing the dot `.` with underline `_` as the former induces errors during data transformation. 
+
+```{r}
+# rename colnames to avoid special characters 
+colnames(data) <- gsub("\\.", "_", colnames(data))
+```
+
+Next, we check the distribution of the dependent variable. From the following table, we can say that the dependent variable is quite balanced: `neutral or dissatisfied` class takes up about 56% of the entire data, while `satisfied` takes up about 43%.
+
+```{r}
+# distribution of the dependent variable 
+data %>% 
+  count(satisfaction) %>% 
+  mutate(pct = prop.table(n))
+```
+
+## Data Visualization 
+
+We group the features in categorical features `fct_vars` and numerical features `num_var` for the purpose of easy handling.
+
+```{r}
+# numeric features: Age, Flight_Distance, Departure_Delay_in_Minutes, Arrival_Delay_in_Minutes
+num_vars <- c("Age", "Flight_Distance", "Departure_Delay_in_Minutes", "Arrival_Delay_in_Minutes")
+# categorical features: 
+fct_vars <- colnames(select(data, -num_vars))
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Distribution (Histograms) for numeric variables
+for (i in 1:length(num_vars)) {
+  name <- paste0('plot', i)
+  
+  namCol <- num_vars[i]
+  
+  p <- ggplot(data) +
+    geom_histogram(aes(x = !!ensym(namCol)),
+                   fill = "gray", color = "black") +
+    labs(x = namCol) +
+    my_theme()
+  
+  assign(name, p)
+  
+}
+
+# plot the distributions 
+grid.arrange(plot1, plot2, plot3, plot4,
+             nrow = 2, ncol = 2)  
+```
+From the histogram above, we observe skewed distributions in `Flight_Distance`, `Departure_Delay_in_Minutes` and `Arrival_Delay_in_Minutes`, there are also long tails particularly in the `Departure Delay` and `Arrival Delay` columns. Indicating that most of the flights are on time.
+
+We noted a large distribution in the `Age` column fall below 18 years of age but we decide to keep them all.
+
+```{r}
+# distribution of age
+table(data$Age)
+```
+
+
+Next, we explore the relationships between the numerical features and the dependent variable `satisfaction`:
+
+```{r warning=FALSE}
+# numeric variables vs. dependent variable 
+ggplot(data, aes(x = Age, group = satisfaction, color = satisfaction, fill = satisfaction)) + 
+  geom_density(alpha = 0.5) +
+  my_theme()
+
+ggplot(data, aes(x = Flight_Distance, group = satisfaction, color = satisfaction, fill = satisfaction)) + 
+  geom_density(alpha = 0.5) +
+  my_theme()
+
+ggplot(data, aes(x = Departure_Delay_in_Minutes, group = satisfaction, color = satisfaction, fill = satisfaction)) + 
+  geom_density(alpha = 0.5) +
+  my_theme()
+
+ggplot(data, aes(x = Arrival_Delay_in_Minutes, group = satisfaction, color = satisfaction, fill = satisfaction)) + 
+  geom_density(alpha = 0.5) +
+  my_theme()
+```
+
+From the density plots above, we observe that customers between the age of late 30s and early 60s are more likely to be satisfied with their flight experience, whereas customers of other ages are more likely to be neutral or dissatisfied. With regards to the flight distance, customers are more likely to be satisfied when the flight distance exceeds 1300 km. For the remaining two plots concerning the delays, we observe no obvious differences in the distribution between different groups of the dependent variable. 
+
+```{r}
+# Categorical variables
+# Distribution (bar) for categorical variables
+for (i in 1:length(fct_vars)){
+  name <- paste0('plot', i)
+  
+  namCol <- fct_vars[i]
+  
+  p <- ggplot(data) +
+    geom_bar(aes(x = !!ensym(namCol)), width = 0.5) +
+    labs(x = namCol) +
+    my_theme() 
+  
+  assign(name, p)
+  
+}
+
+# plot the distributions 
+g1 <- grid.arrange(plot1, plot2, plot3, plot4, plot5, plot6, 
+             nrow = 3, ncol = 2) + my_theme()
+g2 <- grid.arrange(plot7, plot8, plot9, plot10, plot11, plot12, 
+             nrow = 3, ncol = 2) + my_theme()
+g3 <- grid.arrange( plot13, plot14, plot15, plot16, plot17, plot18, 
+             nrow = 3, ncol = 3) + my_theme()
+```
+
+Only the `Gender` feature is rather balanced. Other binary features, such as `Customer_Type`, `Type_of_Travel` have disproportionate distribution of one class over the other. The remaining multiclass features, `Class` and all the rating-related features, have low counts in at least one class, for instance, `Eco Plus` in the `Class` feature. 
+
+```{r}
+# Distribution of the ordinal variables against dependent variables 
+for (i in 1:length(fct_vars)){
+  name <- paste0('plot', i)
+  
+  namCol <- fct_vars[i]
+  
+  p <- ggplot(data) +
+    geom_bar(aes(x = !!ensym(namCol), group = satisfaction,
+                   fill = satisfaction), position = "fill") +
+    labs(x = namCol) +
+    my_theme()
+  
+  assign(name, p)
+  
+}
+
+# plot the distributions 
+# plot the distributions
+library(ggpubr)
+ggarrange(plot1, plot2, plot3, plot4, plot5, plot6,
+             nrow = 3, ncol = 2, common.legend = TRUE, legend="bottom")
+ggarrange(plot7, plot8, plot9, plot10, plot11, plot12,
+             nrow = 3, ncol = 2, common.legend = TRUE, legend="bottom")
+ggarrange( plot13, plot14, plot15, plot16, plot17, plot18,
+             nrow = 3, ncol = 2, common.legend = TRUE, legend="bottom")
+```
+
+When we plot the categorical features grouped by the dependent variable `satisfaction`, we can observe some patterns: business travelers are more likely to be satisfied with the flight experience compared with personal travelers, the satisfaction rate in the `Business` class in also the highest compare with `Eco` and `Eco Plus` in the `Class` feature. 
+
+We observe no significant differences in the distribution of the dependent variable in `Gender`, `Depature_Arrival_time_convenient`.
+
+## Data Preprocessing 
+
+### Categorical features 
+
+There are two types of categorical features in this project: 1. nominal features and 2. ordinal features. The difference is that there is no order between the levels of the nominal features, for instance, "female" and "male" in the `Gender` column,  "Loyal Customer" and "disloyal Customer" in the `Customer_Type` column, and "Business travel" and "Personal Travel" in the `Type_of_Travel` column. Since they all contain only binary levels, we encode them as 0s and 1s. 
+
+```{r}
+# Nominal variables:
+unique(data$Gender) # "Female" and "Male" 
+unique(data$Customer_Type) # "Loyal Customer" and "disloyal Customer"
+unique(data$Type_of_Travel) # "Business travel" and "Personal Travel"
+# all nominal variables have only two levels. we can simply use binary encoding
+data$Gender <- as.integer(ifelse(data$Gender == "Female", 1, 0))
+data$Customer_Type <- as.integer(ifelse(data$Customer_Type == "Loyal Customer", 1 ,0))
+data$Type_of_Travel <- as.integer(ifelse(data$Type_of_Travel == "Business travel", 1, 0))
+```
+
+For the remaining categorical features, which we consider as "ordinal features", we use numeric encoding - which has already been done for the survey ratings. For the `Class` column, we assume there is a ordinal relationship between "Eco", "Eco Plus" and "Business" because it is often associated with the ticket prices. We encode them to 1, 2, and 3 accordingly. 
+
+```{r}
+# Ordinal variables:
+unique(data$Class)
+data$Class <- as.integer(ifelse(data$Class == "Eco", 1, ifelse(data$Class == "Eco Plus", 2, 3)))
+```
+For the dependent variable, `satisfaction`, we will simply convert them using `as.factors()` for now due to the restriction of some models: if we encode them as 0s and 1s some models won't recognize them as categorical features and will return errors.  
+
+```{r}
+data$satisfaction <- as.factor(data$satisfaction)
+```
+Let's have a look at the result: all categorical features have successfully been encoded. 
+```{r}
+tibble::glimpse(data)
+```
+
+### Numerical features 
+
+The skew and long-tail of the distribution of the numerical features that we observed in the previous section may cause problems in the parametric models, such as logistic regression. However, thanks to the nature of the tree-based models, we can simply leave them as they are, and proceed to the modeling part. 
+## Modeling 
+
+Having done the preliminary data processing, we are ready to split the dataset in to training set `train_data` and testing set `test_data`. We choose the 80:20 ratio and set the seed for reproducibility purpose.
+
+```{r}
+## Data Splitting
+
+# for reproducibility 
+set.seed(123)
+
+# data splitting
+index <- sample(1:nrow(data), round(nrow(data) * 0.8))
+train_data <- data[index, ]
+test_data <- data[-index, ]
+```
+
+The proportion of each class in both the training set and test set are similar and balanced:
+
+```{r}
+# check the proportion of each set
+prop.table(table(train_data$satisfaction))
+prop.table(table(test_data$satisfaction))
+```
+The dimension of the training set as well as the test set:
+```{r}
+dim(train_data)
+dim(test_data)
+```
+
+### Decision Tree
+
+#### Introduction 
+
+Decision tree is a nonparamatric algorithm that is built on the basis of divide-and-conquer concept. The algorithm explores the feature space and divide the features into a subset of smaller feature spaces based on certain criteria. Specifically, in the case of classification decision tree, the algorithm divides the dataset into two regions which results in the minimal Gini index, then, the algorithm splits these two regions into four smaller regions which again, have the minimal Gini index, the splitting process repeats until the stopping criteria, e.g. maximum depth is reached. In short, by ansewering a sequence of yes-or-no question, the algorithm will eventually provide the classification result of a given observation. 
+
+Decision trees provide a very intuitive way of visualizing the result. Although its predictive power is not comparable to the more complex algorithms, namely random forest, neural networks, etc. its interpretability makes it stand out. 
+
+We use the library `rpart` to implement the decision tree algorithm. We start with the most basic tree using only the default settings of `rpart()`, no other parameters are specified.
+
+#### Implementation
+
+```{r}
+# a basic tree
+model_dt1 <- rpart(
+  formula = satisfaction ~ .,
+  data = train_data, 
+  method = "class"
+)
+```
+
+The basic tree `model_dt` can be visualized in the following figure. At the top level, the root node, 44% of the customers are satisfied with the service. The node asks whether the customer rated `Online_boarding` less than four, and subsequently divides the entire `100%` dataset into equal halves: 50% having `Online_boarding < 4` and 50% having `Online_boarding >= 4`. 
+
+Moving on along the right branch, for the half who have voted no (`Online_boarding >= 4`), the probability of them being satisfied with the overall service is 72%. The node then asks if the customer is on a business travel (`Type_of_Travel` = 1), if yes, then the probability of the customer being satisfied with the overall service is 85%. 40% of the overall customers are determined through this route.  
+
+```{r}
+# visualize the basic tree model 
+rpart.plot(model_dt1, yesno = 2)
+```
+The feature importance is as follows:
+
+```{r}
+# feature importance
+vip::vip(model_dt1, num_features = 23) + my_theme()
+```
+
+
+Let's check the predictive power of the basic tree on the test set
+
+```{r}
+# prediction
+dt1_pred <- predict(model_dt1, test_data, type = 'class')
+
+# confusion matrix 
+cm_dt1 <- confusionMatrix(as.factor(dt1_pred), as.factor(test_data$satisfaction))
+
+# result
+cm_dt1$table # confusion matrix 
+cm_dt1$overall # accuracy ~ 88.o%
+
+```
+
+The basic tree scores an Accuracy at 88.95%, given that the dependent variable is balanced, the result is quite good. The confusion matrix shows that the model correctly predicted 4607 (2474 + 2133) observations, 369 false positive cases and 203 false negatives. 
+
+The basic tree has already received a good result. Let's see if we can improve the result using model tuning. 
+
+#### Model Tuning
+
+##### Cost of complexity 
+
+From the above tree diagram, we observe that only three features are used for prediction, such as `Online_boarding`, `Inflight_wifi_service`, `Type_of_Travel`, this is because `rpart()` automatically prune the tree behind the scene by adjusting the complexity parameter (cp). The following figure illustrates the changes of the relative cross validation error in response to the cp value. At around the tree size of 6, we would be able to achieve the optimal value. 
+
+```{r}
+plotcp(model_dt1)
+```
+Alternatively, we are able to obtain the optimal cp value from the model result using `model_dt1$cptable`:
+
+```{r}
+# Retrieve optimal cp value based on cross-validated error
+opt_index <- which.min(model_dt1$cptable[, "xerror"])
+cp_opt <- model_dt1$cptable[opt_index, "CP"]
+cp_opt
+```
+Having found the optimal cp value, we use grid search to find the optimal splits and depths. 
+
+```{r}
+# fine tuning - grid search 
+
+splits <- seq(1, 15, 2)
+depths <- seq(1, 30, 4)
+
+grid_dt1 <- expand.grid(
+  minsplit = splits,
+  maxdepth = depths
+)
+```
+
+
+```{r}
+models <- c()
+accu_score <- c()
+
+# start grid search
+for (i in 1:nrow(grid_dt1)) {
+  minsplit <- grid_dt1$minsplit[i]
+  maxdepth <- grid_dt1$maxdepth[i]
+  
+  models[[i]] <- rpart(
+    formula = satisfaction ~ .,
+    data = train_data,
+    method = "class",
+    minsplit = minsplit,
+    maxdepth = maxdepth,
+    control = list(cp = cp_opt)
+  )
+}
+
+for (i in 1:length(models)) {
+  model <- models[[i]]
+  
+  pred <- predict(object = model,
+                  newdata = test_data,
+                  type = "class")
+  
+  accu_score[i] <- mean(pred == test_data$satisfaction)
+}
+
+```
+
+```{r}
+# select the optimal model based on grid search
+mod_dt_index <- which.max(accu_score)
+mod_gs_opt <- models[[mod_dt_index]]
+```
+
+```{r}
+# ROC for the basic tree model
+roc_dt1_train <- prediction(
+  predict(model_dt1, type = "prob")[, 2], 
+  train_data$satisfaction)
+
+roc_dt1_test <- prediction(
+  predict(model_dt1, newdata = test_data, type = "prob")[, 2],
+   test_data$satisfaction) 
+
+plot(performance(roc_dt1_train, "tpr", "fpr"),  col = "blue", main = "ROC")
+plot(performance(roc_dt1_test, "tpr", "fpr"),  col = "blue", lty = "dashed", add=TRUE)
+
+# AUC for the basic tree model 
+auc_dt1_train <- performance(roc_dt1_train, "auc")
+auc_dt1_test  <- performance(roc_dt1_test, "auc")
+
+auc_dt1_train@y.values 
+auc_dt1_test@y.values 
+```
+
+```{r}
+# ROC for the optimal model found via grid search 
+roc_gs_train <- prediction(
+  predict(mod_gs_opt, type = "prob")[, 2], 
+  train_data$satisfaction)
+
+roc_gs_test <- prediction(
+  predict(mod_gs_opt, newdata = test_data, type = "prob")[, 2],
+   test_data$satisfaction) 
+
+plot(performance(roc_gs_train, "tpr", "fpr"),  col = "gray", main = "ROC")
+plot(performance(roc_gs_test, "tpr", "fpr"),  col = "gray", lty = "dashed", add=TRUE)
+plot(performance(roc_dt1_train, "tpr", "fpr"),  col = "blue", add=TRUE)
+plot(performance(roc_dt1_test, "tpr", "fpr"),  col = "blue", lty = "dashed", add=TRUE)
+
+# AUC for the optimal model found via grid search 
+auc_gs_train <- performance(roc_gs_train, "auc")
+auc_gs_test  <- performance(roc_gs_test, "auc")
+
+auc_gs_train@y.values 
+auc_gs_test@y.values 
+```
+
+The AUC value of the basic decision tree is 0.9028184 and 0.9062647 for the training set and test set, respectively, which is the same for the optimal model found via grid search. Such result is foreseeable as the improvement in the accuracy score is negligible (0.889553967 vs. 0.8895540) - which happens mostly due to the rounding. Therefore, we stick to the basic tree. 
+
+Next, we use repeated k-fold cross validation for fine tuning. We set the parameters k = 5 and repeat 3 times: 
+
+```{r}
+# k-fold cross validation 
+
+# Set up caret to perform 5-fold cross validation repeated 3 times
+
+model_dt_cv <- train(
+  satisfaction ~ .,
+  data = train_data,
+  method = "rpart",
+  trControl = trainControl(
+    method = "repeatedcv",
+    number = 5,
+    repeats = 3
+  ),
+  tuneLength = 15
+)
+```
+
+
+```{r}
+# predict on the test set 
+dt_cv_pred <- predict(object = model_dt_cv,
+                      newdata = test_data,
+                      type = "raw")
+```
+
+```{r}
+# confusion matrix 
+cm_dt_cv <- confusionMatrix(as.factor(dt_cv_pred), as.factor(test_data$satisfaction))
+
+cm_dt_cv$table
+
+cm_dt_cv$overall # 0.92179958
+```
+
+The accuracy score increased to 92.62%, as reported by the confusion matrix, we see a significant reduction in false positive (369 to 155) and a slight increase in false negatives (203 to 227).
+
+```{r}
+roc_dtcv_train <- prediction(
+  predict(model_dt_cv, type = "prob")[, 2], 
+  train_data$satisfaction)
+
+roc_dtcv_test <- prediction(
+  predict(model_dt_cv, newdata = test_data, type = "prob")[, 2],
+   test_data$satisfaction) 
+
+plot(performance(roc_dtcv_train, "tpr", "fpr"),  col = "red", main = "ROC")
+plot(performance(roc_dtcv_test, "tpr", "fpr"),  col = "red", lty = "dashed", add=TRUE)
+plot(performance(roc_dt1_train, "tpr", "fpr"),  col = "blue", add=TRUE)
+plot(performance(roc_dt1_test, "tpr", "fpr"),  col = "blue", lty = "dashed", add=TRUE)
+```
+The model performance in term of the ROC curve and AUC scores have both improved. From the ROC plot, the optimal model out-performs the basic decision tree at every level; the AUC scores have reached 0.9658434 and 0.9616846 for the training and test set, respectively.
+
+```{r}
+# AUC 
+auc_dtcv_train <- performance(roc_dtcv_train, "auc")
+auc_dtcv_test  <- performance(roc_dtcv_test, "auc")
+
+print("train AUC value: ")
+auc_dtcv_train@y.values 
+print("test AUC value: ")
+auc_dtcv_test@y.values 
+```
+
+```{r}
+# visualize the optimal tree model
+dt_cv_opt <- model_dt_cv$finalModel
+rpart.plot(dt_cv_opt, yesno = 2)
+```
+```{r}
+dt_cv_opt
+```
+
+We can see that the optimal model is much more complex than the basic decision tree model: having more depths and using more variables. 
+
+From the feature importance plot, we observe that more features are included, and the importance of the two most influential features `Online_boarding` and `Inflight_wifi_service` have increase in the optimal model. 
+
+```{r}
+# feature importance
+vip::vip(dt_cv_opt, num_features = 23) + my_theme()
+```
+### Random Forest
+
+Decision tree is the most basic element of the tree-based algorithms family, the more complex algorithms, such as random forest, is an _ensemble_ of decision trees. The idea of random forest is built on the concept of _the power of large numbers_: decision trees are aggregated into groups, and each group is trained on a random subset of the data, then whichever has the highest predictive power is selected to make the final prediction. The random subset of the data is drawn typically via bagging method (sampling with replacement), so that some observations may be used a few times for training. The downside of the random forest is its interpretability. 
+
+First, we build a simple random forest with default settings:
+
+```{r}
+# random forest with basic setting
+model_rf <- randomForest(satisfaction ~ .,
+                         data = train_data)
+```
+
+Without tuning, we compare the performance of the basic random forest model with the basic decision tree (blue) and optimal decision tree (red). 
+
+
+```{r}
+roc_rf_train <- prediction(
+  predict(model_rf, type = "prob")[, 2], 
+  train_data$satisfaction)
+
+roc_rf_test <- prediction(
+  predict(model_rf, newdata = test_data, type = "prob")[, 2],
+   test_data$satisfaction) 
+
+plot(performance(roc_rf_train, "tpr", "fpr"),  col = "green", main = "ROC")
+plot(performance(roc_rf_test, "tpr", "fpr"),  col = "green", lty = "dashed", add = TRUE)
+plot(performance(roc_dtcv_train, "tpr", "fpr"),  col = "red", add = TRUE)
+plot(performance(roc_dtcv_test, "tpr", "fpr"),  col = "red", lty = "dashed", add = TRUE)
+plot(performance(roc_dt1_train, "tpr", "fpr"),  col = "blue", add=TRUE)
+plot(performance(roc_dt1_test, "tpr", "fpr"),  col = "blue", lty = "dashed", add = TRUE)
+```
+The random forest model has shown its supremacy: the ROC curve has outperformed the best-tuned decision tree model, and the AUC score of the random forest model has exceeded 99%: reaching 99.166% for the training set and 99.18964% for the test set. 
+
+```{r}
+# AUC 
+auc_rf_train <- performance(roc_rf_train, "auc")
+auc_rf_test  <- performance(roc_rf_test, "auc")
+
+print("train AUC value: ")
+auc_rf_train@y.values 
+print("test AUC value: ")
+auc_rf_test@y.values 
+```
+
+The overall accuracy reached 95.29% and the confusion matrix reported a drastic decrease in both false positive (down to 91) and false negatives (down to 153). 
+
+```{r}
+# prediction
+rf_pred <- predict(model_rf, test_data, type = 'class')
+
+# confusion matrix 
+cm_rf <- confusionMatrix(as.factor(rf_pred),
+                          as.factor(test_data$satisfaction))
+
+# result
+cm_rf$table # confusion matrix 
+cm_rf$overall # accuracy ~ 95%
+```
+
+`Online_boarding` and `Inflight_wifi_service` remain the two most influential features, followed by `Type_of_Travel` and `Class`, `Gender` becomes least influential in the random forest model and most notably, features concerning the delay `Arrival_Delay_in_Minutes` and `Departure_Delay_in_Minutes` have gained influences. 
+
+```{r}
+vip::vip(model_rf, num_features = 23) + 
+  my_theme()
+```
+### Model Interpretability
+
+Feature importance only gives us only the global relationship between features of the explained variable of a model, which is often not sufficient if the model is to be implemented in practice, as the local interpretations in terms of how a single observation is rejected or accepted remains unclear. Complex algorithms, including random forest, neural networks, are deemed as black-box due to their lack of local interpretability. In view of this, researchers have developed algorithms such as Local interpretable model-agnostic explanations(LIME) and Shapley values attempting to address this issue. In this section, we briefly touch on the Shapley values and its interpretability.
+
+First, we filter out all the mis-classifications by the random forest model. There are total 244 misclassfications including false positives and false negatives.
+
+```{r}
+# store all misclassifications
+mis_clf <- test_data[rf_pred != test_data$satisfaction,]
+```
+
+Then, we use the R wrapper of the python library `shap` (`shapper`) to explain how the first observation in the mis-classications `mis_clf[1,]` is predicted. 
+
+```{r, message=FALSE, warning=FALSE}
+p_function <-
+  function(model, data)
+    predict(model, newdata = data, type = "prob")
+
+ive_rf <-
+  individual_variable_effect(
+    model_rf,
+    data = train_data,
+    predict_function = p_function,
+    new_observation =  mis_clf[1,],
+    nsamples = 50
+  )
+
+ive_rf_filtered <- dplyr::filter(ive_rf, `_ylevel_` == "satisfied")
+shapper:::plot.individual_variable_effect(ive_rf_filtered)
+```
+
+From the above Shapley plot, we learn that the random forest model `model_rf` predicted that the given observation has 56% probability to be `satisified`, the majority of the confidence comes from the `Online_boarding` feature, which the observation has a value of 5. Although most of the remaining features have negative influences on the final prediction, they are not enough to cancel out the positive influence by `Online_boarding`.
+
+
+
