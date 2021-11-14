@@ -1,0 +1,1942 @@
+---
+title: "Credit Risk Modeling Project"
+author: "Zimin"
+date: "6/25/2021"
+output:
+  prettydoc::html_pretty:
+    highlight: github
+---
+
+# Setting up 
+
+```{r message=FALSE, warning=FALSE}
+# Load libraries
+library(DT)
+library(data.table)
+library(forcats) #NA for Missing
+library(ggplot2)    # visualizations
+library(gridExtra)  # grid plots
+library(ggrepel)
+library(RColorBrewer) #color pallete
+library(scales)
+library(tidyr)
+library(ggpubr)
+library(pcaPP)
+library(ggrepel)
+library(readr)
+library(smbinning) #smbinning
+library(InformationValue)
+library(woeBinning)
+library(dplyr)      # data manipulation 
+library(plyr)
+library(LogisticDx) # - gof()
+library(gtools) # smartbind()
+library(lmtest)
+library(devtools)
+library(Formula)
+library(partykit)
+library(readr)
+library(caTools)
+library(magrittr)
+library(e1071)
+library(rsample)    # for data splitting
+library(caret)      # resampling and model training 
+library(rpart)      # decision tree
+library(rpart.plot) # plotting decision trees
+library(vip)        # feature importance
+library(pdp)        # feature effects 
+library(pROC)       # ROC curve
+library(ROCR)       # ROC curve
+library(randomForest)
+library(DALEX)
+library(shapper)
+
+# disable scientific notation
+options(scipen = 999) 
+```
+
+
+```{r}
+# a function that generates the basic stats of numeric features
+getSummary <- function(x) {
+  summaryMatrix <- rbind(sapply(x, summary),
+                         sapply(x, sd),
+                         sapply(x, kurtosis),
+                         sapply(x, var),
+                         sapply(x, length))
+  rownames(summaryMatrix)[7:10] <- c('Std.Dev.', 'Kurtosis', 'Var', 'Obs.')
+  
+  return(round(summaryMatrix, 2))
+}
+
+# setup customised theme 
+my_theme <- function(){
+  theme_minimal()
+}
+
+# set up customized colors
+col_b = "#1d3557"
+col_r = "#d62828"
+col_g = "#2a9d8f"
+col_i = "#264653"
+```
+
+```{r}
+# Functions needed for quality assessment
+
+hosmerlem = function(y, yhat, g = 20) {
+  cutyhat = cut(yhat,
+                breaks = quantile(yhat, probs = seq(0, 1, 1 / g)),
+                include.lowest = TRUE)
+  obs = xtabs(cbind(1 - y, y) ~ cutyhat)
+  expect = xtabs(cbind(1 - yhat, yhat) ~ cutyhat)
+  chisq = sum((obs - expect) ^ 2 / expect)
+  P = 1 - pchisq(chisq, g - 2)
+  return(list(chisq = chisq, p.value = P))
+  hr = P
+}
+
+# psi for the score
+cal_psi <- function(data1, data2, bench, target, bin)
+{
+  ben <- sort(data1[, bench])
+  tar <- sort(data2[, target])
+
+  # get and sort benchmark and target variable
+  ttl_bench <- length(ben)
+  ttl_target <- length(tar)
+
+  # get total num obs for benchmark and target
+  n <- ttl_bench %/% bin
+  # Num of obs per bin
+  psi_bin <- rep(0, times = bin) #initialize PSI=0 for each bin
+  i = 5
+  for (i in 1:bin) {
+    # calculate PSI for ith bin
+    lower_cut <- ben[(i - 1) * n + 1]
+
+    if (i != bin) {
+      upper_cut <- ben[(i - 1) * n + n]
+      pct_ben <- n / ttl_bench
+    } else {
+      upper_cut <- ben[ttl_bench]
+      pct_ben < (ttl_bench - n * (bin - 1)) / ttl_bench
+    }
+    #last bin should have all remaining obs
+    pct_tar <- length(tar[tar > lower_cut & tar <= upper_cut]) / ttl_target
+    psi_bin[i] <- (pct_tar - pct_ben) * log(pct_tar / pct_ben)
+  }
+  psi <- sum(psi_bin)
+  return(psi)
+}
+
+# psi for a given feature
+cal_psi_zm <- function(data1, data2, bench, target) {
+  ben <- sort(data1[, bench])
+  tar <- sort(data2[, target])
+  bin <- length(unique(ben))
+  bin_tar <- length(unique(tar))
+  # get and sort benchmark and target variable
+  ttl_bench <- length(ben)
+  ttl_target <- length(tar)
+
+  # get total num obs for benchmark and target
+  tab_ben <- table(ben)
+  pct_ben <- tab_ben / ttl_bench
+  names <- names(tab_ben)
+  tab_tar <- as.data.frame(table(tar))
+
+  tab_tar <- merge(as.data.frame(tab_ben), tab_tar, by.x = "ben", by.y = "tar")
+  tab_tar[, is.na(tab_tar)] <- 0
+
+  pct_tar <- tab_tar[, 3] / ttl_target
+  pct_ben <- tab_tar[, 2] / ttl_bench
+  psi_bin <- rep(0, times = bin) #initialize PSI=0 for each bin
+
+  psi_bin <- (pct_tar - pct_ben) * log(pct_tar / pct_ben)
+  psi <- sum(psi_bin)
+
+  return(psi)
+}
+```
+# About the Dataset 
+
+The original dataset is taken from https://www.kaggle.com/teejmahal20/airline-passenger-satisfaction. 
+
+The project is divided into two parts: (1) prediction of the client satisfaction via credit risk approach (2) prediction of client statisfaction using tree-based models. 
+
+# PART I: CREDIT RISK APPROACH 
+
+# Pre-analysis of Data
+
+The dataset consists of 25,976 observations and 25 features, including the target feature `satisfaction`. Since the option `stringsAsFactors = F` is used while importing the data, the features in the raw data set is mainly encoded into two types: numerics and characters. We will encode them to 
+
+```{r}
+# Reading data from CSV
+data.raw <- read.csv(file = "data/test.csv", stringsAsFactors = F)
+
+tibble::glimpse(data.raw)
+```
+
+We examine the number of missing values in each column, and found that there are only 83 missing values in the column `Arrival.Delay.in.Minutes`, which is equivalent to 0.31% of the entire observations. 
+
+```{r}
+# check missing values
+colSums(is.na(data.raw)) # 83 NA in Arrival.Delay.in.Minutes 
+```
+Next, we use a heatmap to plot the location of the missing values in the dataframe, and found that the missing values seem to be clustered near 15000th observations, which indicates that it may not be missing at random. However, due to the small number of missing cases, we decided to remove these observations entirely from the dataset. 
+
+```{r}
+# visualise missing data
+visdat::vis_miss(data.raw)
+```
+
+```{r}
+# remove rows that contain missing values
+data <- data.raw[complete.cases(data.raw), ]
+```
+
+We also remove the columns `X` - the index of the dataset and `id` - the indentifier of the survey, as they are not helpful to the modeling part.
+
+```{r}
+# remove X and ID 
+data <- data %>% 
+  select(c(-1, -2))
+```
+
+We will treat the column `satisfaction` as our dependent variable. It is has already been encoded for the purpose of binary classification by grouping `neutral` and `dissatisfied` into one class and `satisfied` as the other. Since this is a mock project for credit risk analysis, we also refer to `satisfied` as the good bag, and the other as the bad bag in the remainder of the report. The following table reports that the bad bag ratio of the overall dataset is 56% - indicating this is a rather balanced dataset. 
+
+```{r}
+# distribution of the dependent variable 
+data %>% 
+  dplyr::count(satisfaction) %>% 
+  mutate(pct = prop.table(n))
+```
+
+First and foremost, we encode the categorical features from `character` into `factor` as it is the appropriate type recognized by R. 
+
+```{r}
+## CHANGING VAR TO FACTOR 
+# Gender
+data$Gender <- factor(data$Gender, levels = c("Male", "Female"), labels = c("Male", "Female"))
+
+# Customer.Type
+data$Customer.Type <- factor(data$Customer.Type, levels = c("Loyal Customer", "disloyal Customer"), labels = c("Loyal Customer", "disloyal Customer") )
+
+# Type.of.Travel
+data$Type.of.Travel <- factor(data$Type.of.Travel, levels = c("Business travel", "Personal Travel"), labels = c("Business travel", "Personal Travel"))
+
+# Class
+data$Class <- factor(data$Class, levels = c("Eco", "Eco Plus", "Business"), labels = c("Eco", "Eco Plus", "Business"))
+
+# Ratings
+for (col_num in c(7:20)) {
+  data[, col_num] <- factor(data[ , col_num], levels = c(0:5), labels = c(0:5))
+}
+
+# satisfaction
+data$satisfaction <- factor(data$satisfaction, levels = c("satisfied", "neutral or dissatisfied"), labels = c("satisfied", "neutral or dissatisfied"))
+
+```
+
+We also modify the name of the columns to avoid error messages in the data transformation later on. 
+
+```{r}
+# modify colnames to avoid error during data manipulation 
+colnames(data) <- gsub("\\.", "_", colnames(data))
+```
+
+Having done the above, we are ready to classify our features into two broad types: (1) numerical ones and (2) categorical ones for easy handling. 
+
+```{r}
+# dividing variables into FACTORS and NUMERICS
+num_vars <- data[, sapply(data, is.numeric)]
+fct_vars <- data[, sapply(data, is.factor)]
+
+# get the col names 
+num_names <- colnames(num_vars)
+fct_names <- colnames(fct_vars)
+```
+
+## Numerical Features
+
+The following table shows the basic statistics of the numerical features. It is easily observed that the numerical features are on different scales: the `Age` column ranges from 7 to 85, `Flight_Distance` from 31 to 4983, `Departure_Delay_in_Minutes` and `Arrival_Delay_in_Minutes` from 0 to more than 1000. The differences in the means and medians and the Kurtosis values tell us that the distribution of `Flight_Distance`, `Departure_Delay_in_Minutes` and `Arrival_Delay_in_Minutes` are likely to be heavily skewed. 
+
+```{r}
+getSummary(num_vars)
+```
+
+The visualizations confirmed our assumptions about the distributions.
+
+```{r, message=FALSE, warning=FALSE}
+# Distribution (Histograms) for numeric variables
+for (i in 1:length(num_names)) {
+  name <- paste0('plot', i)
+  
+  namCol <- num_names[i]
+  
+  p <- ggplot(data) +
+    geom_histogram(aes(x = !!ensym(namCol)),
+                   fill = "aquamarine3", color = "black") +
+    labs(x = namCol) +
+    my_theme()
+  
+  assign(name, p)
+  
+}
+# plot the distributions 
+grid.arrange(plot1, plot2, plot3, plot4,
+             nrow = 2, ncol = 2)  
+```
+The boxplots show that there are a large number of outliers in both `Departure_Delay_in_Minutes` and `Arrival_Delay_in_Minutes`, this is anticipated as most of the flights are on-time or have short delays. 
+
+```{r, message=FALSE, warning=FALSE}
+# Distribution (Histograms) for numeric variables
+for (i in 1:length(num_names)) {
+  name <- paste0('plot', i)
+  
+  namCol <- num_names[i]
+  
+  p <- ggplot(data) +
+    geom_boxplot(aes(x = !!ensym(namCol)),
+                   fill = "aquamarine3", color = "black") +
+    labs(x = namCol) +
+    my_theme()
+  
+  assign(name, p)
+  
+}
+# plot the distributions 
+grid.arrange(plot1, plot2, plot3, plot4,
+             nrow = 2, ncol = 2)  
+```
+
+## Categorical Features 
+
+There are total 19 categorical features, including the dependent variable, which can be divided into two types:  1. nominal features and 2. ordinal features. The difference is that there is no order between the levels of the nominal features, for instance, "female" and "male" in the `Gender` column,  "Loyal Customer" and "disloyal Customer" in the `Customer_Type` column, and "Business travel" and "Personal Travel" in the `Type_of_Travel` column. 
+
+```{r}
+dim(fct_vars)
+```
+
+From the historgrams below, we observe that only the `Gender` feature is rather balanced. Other binary features, such as `Customer_Type`, `Type_of_Travel` have disproportionate distribution of one class over the other. The remaining multiclass features, `Class` and all the rating-related features, have low counts in at least one class, for instance,  `Eco Plus` in the `Class` feature. 
+
+```{r}
+# Categorical variables
+# Distribution (bar) for categorical variables
+for (i in 1:length(fct_names)){
+  name <- paste0('plot', i)
+  
+  namCol <- fct_names[i]
+  
+  p <- ggplot(data) +
+    geom_bar(aes(x = !!ensym(namCol)), width = 0.5,
+             fill = "aquamarine3") +
+    labs(x = namCol) +
+    my_theme() 
+  
+  assign(name, p)
+  
+}
+# plot the distributions 
+g1 <- grid.arrange(plot1, plot2, plot3, plot4, plot5, plot6, 
+             nrow = 3, ncol = 2) + my_theme()
+g2 <- grid.arrange(plot7, plot8, plot9, plot10, plot11, plot12, 
+             nrow = 3, ncol = 2) + my_theme()
+g3 <- grid.arrange( plot13, plot14, plot15, plot16, plot17, plot18,
+                    plot19,
+             nrow = 3, ncol = 3) + my_theme()
+```
+
+Next, we plot the distribution of good and bad bags in each category using bar plots. The red color represents proportion of the good bad and the blue color represents the proportion of the bad bags. We observe that in columns "Inflight_wifi_service", "Inflight_entertainment", "On_board_service", "Inflight_service", "Cleanliness", there seems to be classes with 0 good bag or bad bag - bars that are filled with only one color. From these plots, we can also observe some patterns: business travelers are more likely to be satisfied with the flight experience compared with personal travelers, the satisfaction rate in the `Business` class in also the highest compare with `Eco` and `Eco Plus` in the `Class` feature. 
+
+```{r}
+# Distribution of the ordinal variables against dependent variables 
+for (i in 1:length(fct_names)){
+  name <- paste0('plot', i)
+  
+  namCol <- fct_names[i]
+  
+  p <- ggplot(data) +
+    geom_bar(aes(x = !!ensym(namCol), group = satisfaction,
+                   fill = satisfaction), position = "fill") +
+    labs(x = namCol) +
+    my_theme()
+  
+  assign(name, p)
+  
+}
+# plot the distributions 
+
+ggarrange(plot1, plot2, plot3, plot4, plot5, plot6,
+             nrow = 3, ncol = 2, common.legend = TRUE, legend="bottom")
+ggarrange(plot7, plot8, plot9, plot10, plot11, plot12,
+             nrow = 3, ncol = 2, common.legend = TRUE, legend="bottom")
+ggarrange( plot13, plot14, plot15, plot16, plot17, plot18,
+             nrow = 3, ncol = 2, common.legend = TRUE, legend="bottom")
+```
+
+Let's take a closer look of these columns, and aggregate the count of observations by the dependent variable `satisfaction`.
+
+```{r}
+# a vector that stores feature names with potentially 0 good/bad bags
+low_distr <- c("Inflight_wifi_service", "Inflight_entertainment", "On_board_service",
+               "Inflight_service", "Cleanliness")
+
+fct_vars %>% 
+  group_by(satisfaction) %>% 
+  dplyr::count(Inflight_wifi_service)
+
+fct_vars %>% 
+  group_by(satisfaction) %>% 
+  dplyr::count(Inflight_entertainment)
+
+fct_vars %>% 
+  group_by(satisfaction) %>% 
+  dplyr::count(On_board_service)
+
+fct_vars %>% 
+  group_by(satisfaction) %>% 
+  dplyr::count(Inflight_service)
+
+fct_vars %>% 
+  group_by(satisfaction) %>% 
+  dplyr::count(Cleanliness)
+```
+
+In `Inflight_wifi_service`, there is 0 count of good bag (`satisfaction`) in the calss `rating=0`. Same observations are found in columns `On_board_service`, `Inflight_service` and `Cleanliness`. We merge these levels, e.g. `ratings = 0` with the next levels, e.g. `ratings = 1` to avoid infinite numbers when calculating Weight of Evidence (WOE).
+
+```{r}
+# merge levels 
+levels(fct_vars$Inflight_entertainment)[1] <- "1"
+levels(fct_vars$On_board_service)[1] <- "1"
+levels(fct_vars$Inflight_service)[1] <- "1"
+levels(fct_vars$Cleanliness)[1] <- "1"
+str(fct_vars)
+```
+
+Remove the dependent variable from the dataset and we are ready to perform fine classing. 
+
+```{r}
+# select the base 
+base <- select(data, -satisfaction)
+base.n <- num_vars
+base.f <- select(fct_vars, -satisfaction)
+```
+  
+# Fine Classing
+
+## Introduction 
+
+## Numerical Features
+
+```{r}
+# cut the numerical features by quantile 
+percentile <-
+  apply(
+    X = base.n,
+    MARGIN = 2,
+    FUN = function(x)
+      round(quantile(x, seq(0.1, 1, 0.1), na.rm = TRUE), 2)
+  )
+
+percentile
+```
+
+
+```{r}
+# get the unique values per column
+unique <- apply(base.n, MARGIN = 2, function(x)
+  length(unique(x)))
+
+unique
+```
+
+```{r}
+# selecting columns with more than 10 unique levels
+numeric <- colnames(base.n[which(unique >= 10)])
+numeric
+
+# convert the rest (<= 10 levels) to categorical features 
+num_as_fact <- colnames(base.n[which(unique < 10 & unique > 1)])
+num_as_fact # we have no such features 
+```
+
+```{r}
+# binarization wrt percentiles 
+for (m in numeric)
+{
+  base.n[, paste(m, "_fine", sep = "")] <- cut(
+    x = as.matrix(base.n[m]),
+    breaks = c(-Inf, unique(percentile[, m])),
+    labels = c(paste("<=", unique(percentile[, m])))
+  )
+}
+```
+
+```{r}
+head(base.n)
+```
+```{r}
+# Weight of Evidence calculation using smbinning
+
+# re-defining GB flag 
+# "satisfied" -> 0
+# "neutral or dissatisfied" -> 1 (default)
+base.n$def <- ifelse(data$satisfaction == "satisfied", 0, 1)
+base.n$def_woe <- 1 - base.n$def
+
+# a vector to store WOE results 
+WOE <- list()
+
+# a dataframe to store IV results 
+IV <- data.frame(VAR = character(), IV = integer())
+```
+
+
+```{r}
+#Choosing vars with _fine suffix 
+base.n_fine <- base.n[, grepl(pattern = "_fine" , x = names(base.n))]
+```
+
+```{r}
+head(base.n_fine)
+```
+
+```{r}
+# Choice of vars to be analysed
+# colnames of numeric variables without def, def_woe
+names.n <-
+  colnames(base.n[, !names(base.n) %in% c(colnames(base.n_fine), "def", "def_woe")])
+
+names.n
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+# iterating through all numerical columns and calculate its woe and iv values
+
+for (i in names.n) {
+  # rows and columns at a chart
+  # par(mfrow = c(2, 2))
+  
+  # `results` contain `$ivtable`, `iv`, `bands`, `x`, `col_id`, `cuts`
+  # `percentile` contains the 10-percentile for all numeric variables
+  results <-
+    smbinning.custom(
+      df = base.n,
+      y = "def_woe",
+      x = i,
+      cuts = unique(percentile[, i])
+    )
+
+  smbinning.plot(results, option = "WoE", sub = i)
+  
+  # IV row binding
+  IV <-
+    rbind(IV, as.data.frame(cbind(
+      "VAR" = i, "IV" = results$ivtable[results$ivtable$Cutpoint == "Total", "IV"]
+    )))
+  
+  # Saving data
+  d <- results$ivtable[, c("Cutpoint", "WoE", "PctRec")]
+  # Total row removal
+  d <- d[d$Cutpoint != "Total", ]
+  # Ordering wrt WoE - for gini etc. calculation
+  d <- d[with(d, order(d$WoE)), ]
+
+  WOE[[i]] <- d
+  
+}
+
+```
+
+The WOE plots above show a non-monotonic relationship, therefore, furthre processing is needed.  
+
+
+## Categorical Features
+
+```{r}
+# variables vector
+names.f <- colnames(base.f[, !names(base.f) %in% c("def", "def_woe")])
+
+names.f
+```
+
+```{r}
+#reverting GB flag
+base.f$def <- ifelse(data$satisfaction == "satisfied", 0, 1)
+base.f$def_woe <- 1 - base.n$def
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+
+for (i in names.f) {
+  
+  # modify column names for easy manipulation 
+  base.f[, paste(i, "_fine", sep = "")] <- base.f[, i]
+  
+  # par(mfrow = c(2, 2))
+  
+  results <-
+    smbinning.factor(
+      df = base.f,
+      y = "def_woe",
+      x = i,
+      maxcat = length(unique(base.f[, i]))
+    )
+
+  # smbinning plots
+  # smbinning.plot(results, option = "dist", sub = i)
+  # smbinning.plot(results, option = "badrate", sub = i)
+  smbinning.plot(results, option = "WoE", sub = i)
+  
+  # update IVs 
+  IV <-
+    rbind(IV, as.data.frame(cbind(
+      "VAR" = i, "IV" = results$ivtable[results$ivtable$Cutpoint == "Total", "IV"]
+    )))
+  
+  # update WOEs 
+  d <- results$ivtable[, c("Cutpoint", "WoE", "PctRec")]
+  d <- d[d$Cutpoint != "Total", ]
+  d <- d[with(d, order(d$WoE)), ]
+  # d$numer <- 11:(nrow(d) + 10)
+  WOE[[i]] <- d
+
+}
+```
+
+## Variables Quality Assessment 
+
+```{r}
+# joining factors and numerics
+# remove duplicated `def` & `def_woe` columns
+base <- cbind(base.f, base.n)[, -c(47, 48)] 
+```
+
+```{r warning=FALSE,message=FALSE}
+# a data frame that stores result 
+stats <- cbind(IV, Gini = NA, miss = NA)
+
+for (l in names(WOE)) {
+  #  replacing NA's to 'Missing' in _fine columns
+  base[, paste(l, "_fine", sep = "")] <-
+    fct_explicit_na(base[, paste(l, "_fine", sep = "")], na_level = "Missing")
+  
+  # objects need for Gini calculation
+  variable <- base[, c("def_woe", paste(l, "_fine", sep = ""))]
+  woe <- WOE[[l]][c("Cutpoint", "WoE")]
+  
+  # Cutpoint values change if Factor
+  if (is.character(woe$Cutpoint) == TRUE)
+  {
+    woe$Cutpoint <- as.factor(gsub("= '|'", "", woe$Cutpoint))
+    woe$Cutpoint <- as.factor(woe$Cutpoint)
+  }
+
+  dat_temp <-
+    merge(
+      variable,
+      woe,
+      by.x = paste(l, "_fine", sep = ""),
+      by.y = "Cutpoint",
+      all.x = T
+    )
+  
+  # name change - append "_woe" after variable name
+  colnames(dat_temp)[which(names(dat_temp) == "WoE")] <- paste(l, "_woe", sep = "")
+  
+  # adding WoE of the var to original dataset
+  base <- merge(base, woe, by.x = paste(l, "_fine", sep = ""),
+                 by.y = "Cutpoint", all.x = T)
+  colnames(base)[which(names(base) == "WoE")] <- paste(l, "_woe", sep = "")
+  
+  #check, whether all values have assigned WoE
+  # print(c(any(is.na(dat_temp[, paste(l, "_woe", sep = "")])), l))
+
+  # calculate GINI
+  gini <- c(2 * auc(dat_temp$def_woe, dat_temp[, paste(l, "_woe", sep = "")]) - 1)
+  
+  # update gini 
+  stats[stats$VAR == l, "Gini"] <- gini
+  
+  
+  miss <-
+    1 - c(nrow(dat_temp[dat_temp[, paste(l, "_fine", sep = "")] != 'Missing',]) /
+            nrow(dat_temp))
+  
+  stats[stats$VAR == l, "miss"] <- miss
+}
+
+# have a peek at `stats`
+datatable(stats) 
+```
+
+According to the Gini scores, `Online_boarding` is the most influencial feature, followed by `Class`. There is only one feature `Arrival_Delay_in_Minutes` that has a Gini index less than 0.1. 
+
+## Correlation Analysis
+
+Correlated features will cause colinearity in the model, hence, we will analyze the Kendall correlation and remove the features that have relatively lower Gini scores. 
+
+```{r}
+# use WOE values for correlation analysis 
+# grab feature names that have _woe but deselect the first column `def_woe`
+var_to_check <- colnames(base)[grep("_woe", colnames(base))][-1]
+
+# data frames for correlation analysis 
+base_kor <- base[, var_to_check]
+
+# kendall correlation 
+kendall2 <- cor.fk(base_kor)
+```
+
+```{r}
+# Visualize the correlation 
+data_corr <- reshape2::melt(cor(kendall2))
+
+# remove `_woe` to shorten labels 
+data_corr$Var1 <- gsub("_woe", "", data_corr$Var1)
+data_corr$Var2 <- gsub("_woe", "", data_corr$Var2)
+
+# plot the correlation heatmap
+ggplot(data_corr, aes(Var2, Var1, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = col_g,
+    high = col_r,
+    mid = "white",
+    midpoint = 0
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(
+    angle = 45,
+    vjust = 1,
+    hjust = 1,
+    size = 8),
+    axis.text.y = element_text(
+      size = 8
+    )
+  ) +
+  coord_fixed() +
+  geom_text(aes(Var2, Var1, label = (round(value, digits = 1))), color = "black", size = 1.5) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank(),
+    axis.ticks = element_blank()
+  )
+```
+We have observed some highly correlated features, such as `Type_of_Travel` and `Class`, given that `Class` has a high Gini index over `Type_of_Travel`, `Type_of_Travel` should be removed from the dataset. 
+
+```{r}
+# threshold for high correlation 
+threshold <- 0.5
+
+# a list that contains all variable names sorted by Gini (in desc order)
+ordered_vars <- stats %>% 
+  arrange(desc(Gini)) %>% 
+  select(VAR, Gini) %>% 
+  filter(Gini > 0.1)
+
+# store variables which are highly correlated
+high_corr <- data_corr %>% 
+  filter((Var1 != Var2) & (abs(value) > threshold)) %>% 
+  merge(ordered_vars, by.x = "Var1", by.y = "VAR", all.x = T) %>% 
+  arrange(desc(Gini)) %>% 
+  filter(Gini > 0.1)
+
+# empty vectors to store result 
+vars_to_remove <- c() 
+vars_to_keep <- c()
+
+# declare a negate operator 
+`%notin%` <- Negate(`%in%`)
+
+# iterating through `ordered_vars` list 
+for (var_i in ordered_vars$VAR) {
+
+  # if `var_i` is not already in the list `vars_to_remove`
+  if (var_i %notin% vars_to_remove) {
+    
+    # if `var_i` is in `high_corr` 
+    if (var_i %in% high_corr$Var1) {
+      
+      # get the variable name in `Var2` column
+      var_j = high_corr[high_corr["Var1"] == var_i, "Var2"]
+      # add `Var2` in `high_corr` to `vars_to_remove`
+      vars_to_remove <- append(vars_to_remove, var_j)
+      # remove rows in high_corr that contains Var2
+      high_corr <- high_corr[(high_corr["Var1"] != var_j) & (high_corr["Var2"] != var_j),]
+      # add var_i to `vars_to_keep`
+      vars_to_keep <- append(vars_to_keep, var_i)
+      
+    } else {
+    
+    # if var_i is not in `high_corr`, add it to `vars_to_keep` 
+    vars_to_keep <- append(vars_to_keep, var_i)
+  }}}
+
+```
+
+
+
+```{r}
+# merging of data with stats and correlations
+
+base_coarse <- base[-grep("_fine", colnames(base))]
+# kols <- c(as.character(all$VAR), "def", "def_woe")
+kols <- c(vars_to_keep, "def", "def_woe")
+# base_coarse <- base_coarse %>% select(kols)
+base_coarse <- base[, kols]
+```
+
+Since the dataset is rather balanced in terms of the dependent variable, we can split them using `sample()` 
+
+```{r}
+# Data Splitting
+
+# for reproducibility 
+set.seed(123)
+
+# data splitting
+index <- sample(1:nrow(base_coarse), round(nrow(base_coarse) * 0.8))
+train <- base_coarse[index, ]
+test <- base_coarse[-index, ]
+```
+  
+Let's take a look at the structure of the training set and test set. Categorical features and numerical features have been correctly sorted out. The number of features have dropped to 12 after fine classing. 
+
+```{r}
+tibble::glimpse(train)
+tibble::glimpse(test)
+```
+
+# Coarse Classing
+
+## Numerical Features
+
+```{r}
+# names of numeric features
+columns.n <- colnames(train[, vars_to_keep][, sapply(train[, vars_to_keep], is.numeric)])
+
+# names of categorical features
+columns.f <- colnames(train[, vars_to_keep][, sapply(train[, vars_to_keep], is.factor)])
+```
+
+
+```{r}
+# total <- length(columns.n) # number of numeric features 
+
+# an empty data frame that stores VAR name and VALUE 
+temp <- data.frame(VAR = character(), VALUE = integer())
+
+# an empty data frame that stores the following results
+stats <-
+  data.frame(
+    VAR = character(),
+    IV = integer(),
+    Gini = integer(),
+    MISS = integer(),
+    IV_val = integer(),
+    Gini_val = integer(),
+    MISS_val = integer()
+  )
+
+#cut offs for testing data
+cut_offs <- data.frame(VAR = character(), cuts = integer())
+```
+
+```{r}
+# WOE binning and calculation 
+
+k <- 0
+
+for (var_i in columns.n) {
+  
+  k <- k + 1
+  
+  par(xpd = T,
+      mar = par()$mar,
+      mfrow = c(1, 1))
+  
+  # if var_i is of type character then convert it to factor
+  if (class(train[, c(var_i)])[1] == "character") {
+    train[, c(var_i)] <- as.factor(train[, c(var_i)])
+  }
+  
+  # apply `woe.tree.binning` (tree-like) on the selected var
+  # result contains woe, binning, and IV
+  result <-
+    woe.tree.binning(
+      train,
+      "def",
+      var_i,
+      min.perc.total = 0.1,
+      min.perc.class = 0.05,
+      event.class = 1
+    )
+  
+  
+  # if object result was created and information value of the variable is higher that 0 then continue
+  if (length(result) > 1 & result[[3]] > 0) {
+    
+    IV <- result[[3]]
+    
+    # apply `woe.tree.binning` results on the original train data
+    train <- woe.binning.deploy(train, result, add.woe.or.dum.var = "woe")
+    
+    # var_i name for readability
+    var_i_name <- paste0("woe.", var_i, ".binned")
+    
+    # divide the `woe.tree.binning` result by 100 
+    train[, var_i_name] <- train[, var_i_name] / 100
+    
+    # replace `-Inf` and `Inf` values with -2 or 2 
+    train[, var_i_name] <- ifelse(train[, var_i_name] == -Inf, -2, train[, var_i_name])
+    train[, var_i_name] <- ifelse(train[, var_i_name] == Inf, 2, train[, var_i_name])
+    
+    # Gini calculation 
+    gini <- 2 * pROC::auc(train[, "def"], train[, var_i_name], direction = ">") - 1
+    
+    # % missings
+    miss <- 1 - nrow(train[!(is.na(train[, var_i])), ]) / nrow(train)
+    
+    # do the same for test set 
+    test <- woe.binning.deploy(test, result, add.woe.or.dum.var = "woe")
+    test[, var_i_name] <- test[, var_i_name] / 100
+
+    test[, var_i_name] <- ifelse(test[, var_i_name] == -Inf, -2, test[, var_i_name])
+    test[, var_i_name] <- ifelse(test[, var_i_name] == Inf, 2, test[, var_i_name])
+    
+    giniw <- 2 * auc(test[, "def"], test[, var_i_name], direction = ">") - 1
+    
+    IVw <- IV(X = test[, paste0(var_i, ".binned")], Y = test$def)[1]
+    missw <- 1 - nrow(test[!(is.na(test[, var_i])), ]) / nrow(test)
+    
+    # appending stats dataset with obtained statistics
+    stats <- rbind(stats, 
+                   as.data.frame(
+                     cbind(
+                       "VAR" = var_i,
+                       "IV" = IV,
+                       "Gini" = gini,
+                       "MISS" = miss,
+                       "IV_val" = IVw,
+                       "Gini_val" = giniw,
+                       "MISS_val" = missw
+                     )
+                   ))
+    
+    # WoE and default rate per created bucket
+    mixed <- c("#cccccc", "#e6e6e6", "#cccccc", "#e6e6e6", "#cccccc",
+               "#e6e6e6", "#cccccc", "#e6e6e6", "#cccccc", "#e6e6e6")
+    
+    plot <- data.frame(result[[2]])
+    plot$bins <- rownames(plot)
+    plot$woe <- plot$woe / 100
+    plot$woe <-
+      ifelse(plot$woe == Inf, -2, ifelse(plot$woe == -Inf, -2, plot$woe))
+    plot$woe <-
+      ifelse(rownames(plot) == "Missing" & plot$woe > 3, 0, plot$woe)
+    plot$woe <-
+      ifelse(rownames(plot) == "Missing" & plot$woe < (-3), 0, plot$woe)
+    plot <- na.omit(plot)
+    plot <- plot %>% filter(X1 + X0 > 0)
+    
+    plot$woe_plot <- paste0('WoE=', round(plot$woe, 2))
+    plot$fill_plot <-
+      paste0('Fill=', round(((plot$X1 + plot$X0) / sum(plot$X1 + plot$X0)
+      ), 2))
+    plot$GoodRate <- plot$X1 / plot$X0
+    
+    
+    plot$bins <- factor(plot$bins)
+    plot$bins <- fct_reorder(plot$bins, plot$cutpoints.final, min)
+    
+    plot_1 <- ggplot(plot, aes(x = bins, y = woe)) +
+      geom_bar(stat = "identity", fill = mixed[1:length(unique(plot$cutpoints.final..1.))]) +
+      geom_line(aes(x = bins, y = GoodRate),
+                group = 1,
+                color = "#333333") +
+      geom_text_repel(
+        aes(
+          x = bins,
+          y = GoodRate,
+          label = scales::percent(GoodRate)
+        ),
+        vjust = -0.6,
+        size = 2
+      ) +
+      geom_text_repel(aes(label = woe_plot), vjust = 1, size = 2) +
+      geom_text_repel(aes(label = fill_plot),
+                      vjust = -0.5,
+                      size = 2) +
+      scale_y_continuous(sec.axis = sec_axis(
+        ~ .,
+        labels = function(b) {
+          paste0(round(b * 100, 0), "%")
+        }
+      )) +
+      theme_minimal() +
+      labs(title = "WoE and default rate per bucket", subtitle = var_i) +
+      theme(
+        plot.title = element_text(hjust = 0.5, size = 9),
+        plot.subtitle = element_text(hjust = 0.5, size = 9),
+        axis.text = element_text(size = 7)
+      )
+    
+    print(plot_1)
+  }
+  
+  # for wchich vars woe was calculated
+  temp <-
+    rbind(temp, as.data.frame(cbind(
+      VAR = var_i, VALUE = length(result) > 1
+    )))
+  names(temp) <- c("VAR", "VALUE")
+}
+
+```
+
+## Categorical Features
+
+
+```{r}
+# progress bar
+total <- length(columns.f) # 14 features 
+
+k <- 0
+
+var_i <- columns.f[2]
+
+for (var_i in columns.f) {
+  k <- k + 1
+  par(xpd = T,
+      mar = par()$mar,
+      mfrow = c(1, 1))
+  
+  # if var_i is of type character then convert it to factor
+  if (class(train[, c(var_i)])[1] == "character") {
+    train[, c(var_i)] <- as.factor(train[, c(var_i)])
+  }
+  
+  # applying woe.tree.binning() function;
+  # if calculated parameter min.perc.total is out of accepted range, the default value of 0.01 is set
+  result <-
+    woe.tree.binning(
+      train,
+      "def",
+      var_i,
+      min.perc.total = 0.1,
+      min.perc.class = 0.05,
+      event.class = 1
+    )
+  
+  
+  # if object result was created and information value of the variable is higher that 0 then continue
+  if (length(result) > 1 & result[[3]] > 0) {
+    # saving information value of variable to IV object
+    IV <- result[[3]]
+    # woe.binning.deploy function applies the binning solution generated to original data (train)
+    # it creates two new variables: one with cuts (var_i.binned) and one with woe score (woe.var_i.binned)
+    train <-
+      woe.binning.deploy(train, result, add.woe.or.dum.var = "woe")
+    train[, paste0("woe.", var_i, ".binned")] <-
+      train[, paste0("woe.", var_i, ".binned")] / 100
+    # Gini calculation based on woe values
+    # with missing values but replaced with -2 or 2 respecitively
+    train[, paste0("woe.", var_i, ".binned")] <-
+      ifelse(train[, paste0("woe.", var_i, ".binned")] == -Inf, -2, train[, paste0("woe.", var_i, ".binned")])
+    train[, paste0("woe.", var_i, ".binned")] <-
+      ifelse(train[, paste0("woe.", var_i, ".binned")] == Inf, 2, train[, paste0("woe.", var_i, ".binned")])
+    gini <-
+      2 * pROC::auc(train[, "def"], train[, paste0("woe.", var_i, ".binned")], direction =
+                      ">") - 1
+    # % missings
+    miss <- 1 - nrow(train[!(is.na(train[, var_i])), ]) / nrow(train)
+    # appending stats dataset with obtained statistics
+    
+    
+    # woe.binning.deploy function applies the binning solution generated to original data (train)
+    # it creates two new variables: one with cuts (var_i.binned) and one with woe score (woe.var_i.binned)
+    test <- woe.binning.deploy(test, result, add.woe.or.dum.var = "woe")
+    test[, paste0("woe.", var_i, ".binned")] <-
+      test[, paste0("woe.", var_i, ".binned")] / 100
+    # Gini calculation based on woe values
+    # with missing values but replaced with -2 or 2 respecitively
+    test[, paste0("woe.", var_i, ".binned")] <-
+      ifelse(test[, paste0("woe.", var_i, ".binned")] == -Inf, -2, test[, paste0("woe.", var_i, ".binned")])
+    test[, paste0("woe.", var_i, ".binned")] <-
+      ifelse(test[, paste0("woe.", var_i, ".binned")] == Inf, 2, test[, paste0("woe.", var_i, ".binned")])
+    giniw <-
+      2 * auc(test[, "def"], test[, paste0("woe.", var_i, ".binned")], direction =
+                ">") - 1
+    # saving information value of variable to IV object
+    source("ivmult.r")
+    IVw <- IV(X = test[, paste0(var_i, ".binned")], Y = test$def)[1]
+    # % missings
+    missw <- 1 - nrow(test[!(is.na(test[, var_i])), ]) / nrow(test)
+    
+    # appending stats dataset with obtained statistics
+    stats <- rbind(stats,
+                   as.data.frame(
+                     cbind(
+                       "VAR" = var_i,
+                       "IV" = result[[3]],
+                       "Gini" = gini,
+                       "MISS" = miss,
+                       "IV_val" = IVw,
+                       "Gini_val" = giniw,
+                       "MISS_val" = missw
+                     )
+                   ))
+    
+    # WoE and default rate per created bucket
+    mixed <- c("#cccccc", "#e6e6e6", "#cccccc", "#e6e6e6", "#cccccc",
+               "#e6e6e6", "#cccccc", "#e6e6e6", "#cccccc", "#e6e6e6")
+    
+    plot <- data.frame(result[[2]])
+    plot$woe <- ifelse(plot$woe == Inf, -2, ifelse(plot$woe == -Inf, -2, plot$woe))
+    plot$woe <- plot$woe / 100
+    plot <- na.omit(plot)
+    plot <- plot %>% dplyr::select(-Group.1) %>% distinct()
+    
+    plot$woe_plot <- paste0('WoE=', round(plot$woe, 2))
+    plot$fill_plot <- paste0('Fill=', 
+                             round(((plot$X1 + plot$X0) / sum(plot$X1 + plot$X0)), 2))
+    plot$GoodRate <- ifelse(is.na(plot$X0), 1, (plot$X1) / (plot$X1 + plot$X0))
+    plot$Group.2 <- fct_reorder(plot$Group.2, plot$woe, min)
+    
+    plot_1 <- ggplot(plot, aes(x = Group.2, y = woe)) +
+      geom_bar(stat = "identity", fill = mixed[1:length(unique(plot$woe))]) +
+      geom_line(aes(x = Group.2, y = GoodRate), group = 1, color = "#333333") +
+      geom_text_repel(aes(
+        x = Group.2,
+        y = GoodRate,
+        label = scales::percent(GoodRate)),
+        vjust = -0.6,
+        size = 2) +
+      geom_text_repel(aes(label = woe_plot), vjust = 1, size = 2) +
+      geom_text_repel(aes(label = fill_plot),
+                      vjust = -0.5,
+                      size = 2) +
+      scale_y_continuous(sec.axis = sec_axis(~ ., labels = function(b) {
+          paste0(round(b * 100, 0), "%")})) +
+      theme_minimal() +
+      labs(title = "WoE and default rate per bucket", subtitle = var_i) +
+      theme(
+        axis.title.x = element_blank(),
+        plot.title = element_text(hjust = 0.5, size = 9),
+        plot.subtitle = element_text(hjust = 0.5, size = 9),
+        axis.text = element_text(size = 7)
+      )
+    print(plot_1)
+  }
+  
+  # for wchich vars woe was calculated
+  temp <- rbind(temp, as.data.frame(cbind(VAR = var_i, VALUE = length(result) > 1)))
+  names(temp) <- c("VAR", "VALUE")
+}
+```
+```{r}
+stats
+```
+
+After coarse classing, now we observe a rather monotonic relationship in the features, we are ready to proceed with the modeling. 
+
+```{r}
+tibble::glimpse(train)
+tibble::glimpse(test)
+```
+
+
+# Modeling 
+
+Having done the coarse classing, we will estimate two models using logistic regression, the first being a benchmark model with only a constant, the other one, `max_mod`, estimated using all selected features. 
+
+```{r}
+# grab the colnames started with `woe` (after transformation)
+cols <- colnames(train)[grep("woe", colnames(train))]
+
+# use column `def` instead of `def_woe` 
+cols <- cols[-grep("def_woe", cols)]
+
+# select columns in `train` and `test` dataset respectively 
+mod_train <- train[, c("def", cols)]
+mod_test <- test[, c("def", cols)]
+
+# change `def` column into factors
+mod_train$def <- as.factor(mod_train$def)
+mod_test$def <- as.factor(mod_test$def)
+```
+
+```{r}
+# base model with constant only.
+base_mod <- glm(def ~ 1, data = mod_train, family = binomial("logit"))
+summary(base_mod)
+# (Intercept) = 0.2456 
+```
+
+```{r}
+# model with all variables
+
+# build formula 
+n <- names(mod_train)
+f <- as.formula(paste("def ~", paste(n[!n %in% "def"], collapse = " + ")))
+
+max_mod <- glm(f, data = mod_train, family = binomial("logit"))
+summary(max_mod)
+```
+
+All the variables are statistically significant in the full model `max_mod`. 
+
+## Quality Assessment 
+
+```{r}
+# basic gof test 
+# H0: the model is well fitted to the data
+gf <- pchisq(max_mod$deviance, max_mod$df.residual, lower.tail = F)
+gf
+```
+P-value = 1 > 5% significance level suggests that we can't reject the null hypothesis that our model is well fitted to the data. 
+
+
+```{r}
+# H0 variables are statistically irrelevant
+param_sig <-  pchisq(max_mod$null.deviance - max_mod$deviance,
+               max_mod$df.null - max_mod$df.residual, lower.tail = F)
+```
+P-value = 0 < 5% significance level suggest that we reject the null hypothesis that our variables are statistically irrelevant - this is also confirmed in the results in `summary(max_mod)`
+
+```{r message=FALSE, warning=FALSE}
+# Hosmera - Lemeshowa test  - basic GOF test a model with for binary dependent variable
+# H0: the model is well fitted to the data
+# has many disadvantages - first of all it is very sensitive to the number of buckets
+hr <- hosmerlem(y = mod_train$def, yhat = fitted(max_mod), g = 9)
+```
+
+```{r message=FALSE, warning=FALSE}
+# https://cran.r-project.org/web/packages/gof/gof.pdf
+# HL <- Hosmer-Lemeshow test
+# mHL <- modified Hosmer-Lemeshow test
+# OsRo <- Osius - Rojek of the link function test
+# 
+# S Stukel's tests:
+#   SstPgeq0.5	 score test for addition of vector z1
+#   SstPl0.5	 score test for addition of vector z2
+#   SstBoth	 score test for addition of vector z1 and z2
+#   SllPgeq0.5	 log-likelihood test for addition of vector z1
+#   SllPl0.5	 log-likelihood test for addition of vector z2
+#   SllBoth	 log-likelihood test for addition of vectors z1 and z2
+gof <- gof(max_mod, g = 10)
+
+datatable(gof$gof) %>% formatRound(c(3, 5), 5)
+```
+
+From the result above, all Hosmer-Lemeshow test, modified Hosmer-Lemeshow test and Osius - Rojek of the link function test suggest that our model as a whole is inappropriate (having P-values=0, well below the 5% significance level). On the other hand, the AUC value is 95.6% (confidence interval: 95.4% - 95.9%). 
+
+```{r message=FALSE, warning=FALSE}
+# Assigning scores 
+
+mod_train$base_mod <- base_mod$fitted.values
+mod_train$max_mod <- max_mod$fitted.values
+
+# scaling PD to assumed scale
+# 660 points means ODDS = 72 and ODDS double for 40 points
+
+mod_train$score <- (660-40/log(1/2)*log(1/72)) + 40/log(1/2) * max_mod$linear.predictors
+
+# assaignig PD & SCORE 
+# assuming 50% cut-off by default - more details later
+mod_train$max_mod <- predict(max_mod, newdata = train, type = "response") 
+mod_train$score <- (660-40/log(1/2)*log(1/72))+40/log(1/2) * predict(max_mod, newdata = mod_train, type="link")
+
+mod_test$max_mod <- predict(max_mod, newdata = test, type = "response") 
+mod_test$score <- (660-40/log(1/2)*log(1/72)) + 40/log(1/2) * predict(max_mod, newdata = mod_test, type = "link")
+```
+
+```{r message=FALSE, warning=FALSE}
+#test roc - checking wheter ROC cure is significanlty better
+#H0  ROC curves are equally good
+
+roc_test <- roc.test(mod_train$def, mod_train$max_mod, mod_train$base_mod, method = "d")$p.value
+
+# 1. reject the h0
+# 2. fail to reject the ho
+roc_test
+```
+
+According to the result of the ROC test, we reject the null hypothesis that the ROC of the benchmark model and the full model `max_mod` is equally good - the full model `max_mod` is significantly better. 
+
+```{r message=FALSE, warning=FALSE}
+# distributions of good and bad bags
+ggplot(mod_train, aes(x = score, group = as.factor(def), fill = as.factor(def))) +
+  geom_histogram(color = "black") +
+  scale_fill_manual(values = c(col_g, col_r)) + 
+  facet_wrap(def ~.) +
+  my_theme()
+```
+From the distributions of the good and bad bags based on the score cards, we observe that the good bags (filled in green color) have a lower density in the scores < 500, they are mostly clustered around scores that are slightly higher than 500, and there is also a bump in the region of 800 - 900 points. On the other hand, the bad bags are generally distributed in the region that's lower than 500 points. This indicates that our model is able to differentiate the good and bad bags given the scores. 
+
+```{r message=FALSE, warning=FALSE}
+# Gini index 
+gini_train <- 2 * auc(mod_train$def, mod_train$max_mod, direction = "<") - 1
+gini_test <- 2 * auc(mod_test$def, mod_test$max_mod, direction = "<") - 1
+
+# Gini with CI
+gini_train_ci <- 2 * ci.auc(mod_train$def, mod_train$max_mod, method = "d", direction = "<") - 1
+gini_test_ci <- 2 * ci.auc(mod_test$def, mod_test$max_mod, method = "d", direction = "<") - 1
+
+# Area Under Curve (AUC)
+auc_train <- auc(mod_train$def, mod_train$max_mod, direction = "<")
+auc_test <- auc(mod_test$def, mod_test$max_mod, direction = "<") 
+
+# AUC with CI 
+auc_train_ci <- ci.auc(mod_train$def, mod_train$max_mod, method = "d", direction = "<")
+auc_test_ci <- ci.auc(mod_test$def, mod_test$max_mod, method = "d", direction = "<")
+```
+
+```{r message=FALSE, warning=FALSE}
+#K-S statistics
+  # statistics of the Kolmogorov - Smirnov test comparing two distributions
+  # scallions of scores are compared to good and bad customers,
+  # the more they differ from each other the better
+ks_score_train <-
+  ks.test(mod_train[mod_train$def == 0, c("score")], mod_train[mod_train$def == 1, c("score")])$statistic
+ks_score_test <-
+  ks.test(mod_test[mod_test$def == 0, c("score")], mod_test[mod_test$def == 1, c("score")])$statistic
+```
+
+Kolmogorov - Smirnov scores are similar for training and test set: 0.7967501 vs 0.8033905. 
+
+```{r message=FALSE, warning=FALSE}
+
+# stability of a model
+
+#PSI - checking difference between two distributions (IV)
+psi <- cal_psi(data1 = mod_train,
+               data2 = mod_test,
+               bench = "score", 
+               target = "score", bin = 5)
+
+ks <- ks.test(mod_train$score,mod_test$score)$p.value
+```
+
+psi = 0.001 < 0.1 threshold, the distribution of the score card is stable. Same conclusion can be drawn from the ks test: P-value = 0.9515911 > 5% significance level, therefore, the distribution of our score card is stable. 
+
+```{r message=FALSE, warning=FALSE}
+mdl_name <- "max_model"
+vars_vect <- names(max_mod$coefficients)[2:length(max_mod$coefficients)]
+
+# var_qual <- NULL
+# models_qual <- NULL
+var_qual_list <- NULL
+
+
+for (i in 1:length(vars_vect)) {
+  tab <- NULL
+  tab$model <- mdl_name
+  v_name <- gsub("woe.", "", vars_vect[i])
+  v_name <- gsub(".binned", "", v_name)
+  tab$var_name <- v_name
+  tab$gini_train <-
+    2 * ci.auc(mod_train[!is.na(mod_train[, vars_vect[i]]), c("def")],
+               mod_train[!is.na(mod_train[, vars_vect[i]]), vars_vect[i]],
+               direction = ">",
+               method = "d")[2] - 1
+  tab$gini_test <-
+    2 * ci.auc(mod_test[!is.na(mod_test[, vars_vect[i]]), c("def")], mod_test[!is.na(mod_test[, vars_vect[i]]), vars_vect[i]], direction =
+                 ">", method = "d")[2] - 1
+  
+  tab$psi <-
+    cal_psi_zm(
+      data1 = mod_train[!is.na(mod_train[, vars_vect[i]]), vars_vect],
+      data2 = mod_test[!is.na(mod_test[, vars_vect[i]]), vars_vect],
+      bench = vars_vect[i],
+      target = vars_vect[i]
+    )
+  tab <- as.data.frame(tab)
+  var_qual_list <- rbind(var_qual_list, tab)
+}
+```
+
+```{r}
+datatable(var_qual_list) %>% formatRound(c(3:5), 6)
+```
+
+
+```{r}
+models_qual <- as.data.table(
+  cbind(
+    "Model" = "Max Model",
+    
+    "goodness-of-fit" = gf,
+    "hosmer" = hr$p.value,
+    "gof" = gof$gof$pVal[3],
+    "param_sig" = param_sig,
+
+    "roc_test_base_mod" = roc_test,
+    
+    "gini_train" = gini_train,
+    "gini_train_ci_lower" = gini_train_ci[1],
+    "gini_train_ci_upper" = gini_train_ci[3],
+    "gini_test" = gini_test,
+    "gini_test_ci_lower" = gini_test_ci[1],
+    "gini_test_ci_upper" = gini_test_ci[3],
+    
+    "auc_train" = auc_train,
+    "auc_train_ci_lower" = auc_train_ci[1],
+    "auc_train_ci_upper" = auc_train_ci[3],
+    "auc_test" = auc_test,
+    "auc_test_ci_lower" = auc_test_ci[1],
+    "auc_test_ci_upper" = auc_test_ci[3],
+    
+    "ks_score_train" = ks_score_train,
+    "ks_score_test" = ks_score_test,
+    "psi" = psi,
+    "ks_test" = ks
+
+  )
+)
+```
+
+
+
+```{r}
+models_qual_list <- transpose(models_qual)
+colnames(models_qual_list) <- rownames(models_qual)
+rownames(models_qual_list) <- colnames(models_qual)
+
+# display the result
+datatable(models_qual_list) %>% formatRound(1, 5)
+```
+  
+```{r}
+# ROC for the logistic regression 
+prob_lr_train <- predict(max_mod, type = c("response"))    
+prob_lr_test <- predict(max_mod, newdata = mod_test, type = c("response"))
+
+pred_lr_train <- prediction(prob_lr_train, mod_train$def)    
+pred_lr_test <- prediction(prob_lr_test, mod_test$def)   
+
+plot(performance(pred_lr_train, "tpr", "fpr"),  col = "gray", main = "ROC")
+plot(performance(pred_lr_test, "tpr", "fpr"),  col = "gray", lty = "dashed", add=TRUE)
+```
+```{r}
+
+```
+
+  
+# PART II: TREE-BAED MODELS
+
+```{r}
+# re-read data
+data.raw <- read.csv("data/test.csv", stringsAsFactors = F)
+```
+
+```{r}
+# remove rows that contain missing values
+data <- data.raw[complete.cases(data.raw), ]
+
+# remove X and ID 
+data <- data %>% 
+  select(-c(X, id))
+```
+
+```{r}
+# rename colnames to avoid special characters 
+colnames(data) <- gsub("\\.", "_", colnames(data))
+```
+
+
+# Data Visualization 
+
+We group the features in categorical features `fct_vars` and numerical features `num_var` for the purpose of easy handling.
+
+```{r}
+# numeric features: Age, Flight_Distance, Departure_Delay_in_Minutes, Arrival_Delay_in_Minutes
+num_vars <- c("Age", "Flight_Distance", "Departure_Delay_in_Minutes", "Arrival_Delay_in_Minutes")
+# categorical features: 
+fct_vars <- colnames(select(data, -num_vars))
+```
+
+
+We explore the relationships between the numerical features and the dependent variable `satisfaction`:
+
+```{r warning=FALSE}
+# numeric variables vs. dependent variable 
+ggplot(data, aes(x = Age, group = satisfaction, color = satisfaction, fill = satisfaction)) + 
+  geom_density(alpha = 0.5) +
+  my_theme()
+
+ggplot(data, aes(x = Flight_Distance, group = satisfaction, color = satisfaction, fill = satisfaction)) + 
+  geom_density(alpha = 0.5) +
+  my_theme()
+
+ggplot(data, aes(x = Departure_Delay_in_Minutes, group = satisfaction, color = satisfaction, fill = satisfaction)) + 
+  geom_density(alpha = 0.5) +
+  my_theme()
+
+ggplot(data, aes(x = Arrival_Delay_in_Minutes, group = satisfaction, color = satisfaction, fill = satisfaction)) + 
+  geom_density(alpha = 0.5) +
+  my_theme()
+```
+
+From the density plots above, we observe that customers between the age of late 30s and early 60s are more likely to be satisfied with their flight experience, whereas customers of other ages are more likely to be neutral or dissatisfied. With regards to the flight distance, customers are more likely to be satisfied when the flight distance exceeds 1300 km. For the remaining two plots concerning the delays, we observe no obvious differences in the distribution between different groups of the dependent variable. 
+
+# Data Preprocessing 
+
+## Categorical features 
+
+There are two types of categorical features in this project: 1. nominal features and 2. ordinal features. The difference is that there is no order between the levels of the nominal features, for instance, "female" and "male" in the `Gender` column,  "Loyal Customer" and "disloyal Customer" in the `Customer_Type` column, and "Business travel" and "Personal Travel" in the `Type_of_Travel` column. Since they all contain only binary levels, we encode them as 0s and 1s. 
+
+```{r}
+# Nominal variables:
+unique(data$Gender) # "Female" and "Male" 
+unique(data$Customer_Type) # "Loyal Customer" and "disloyal Customer"
+unique(data$Type_of_Travel) # "Business travel" and "Personal Travel"
+# all nominal variables have only two levels. we can simply use binary encoding
+data$Gender <- as.integer(ifelse(data$Gender == "Female", 1, 0))
+data$Customer_Type <- as.integer(ifelse(data$Customer_Type == "Loyal Customer", 1 ,0))
+data$Type_of_Travel <- as.integer(ifelse(data$Type_of_Travel == "Business travel", 1, 0))
+```
+
+For the remaining categorical features, which we consider as "ordinal features", we use numeric encoding - which has already been done for the survey ratings. For the `Class` column, we assume there is a ordinal relationship between "Eco", "Eco Plus" and "Business" because it is often associated with the ticket prices. We encode them to 1, 2, and 3 accordingly. 
+
+```{r}
+# Ordinal variables:
+unique(data$Class)
+data$Class <- as.integer(ifelse(data$Class == "Eco", 1, ifelse(data$Class == "Eco Plus", 2, 3)))
+```
+For the dependent variable, `satisfaction`, we will simply convert them using `as.factors()` for now due to the restriction of some models: if we encode them as 0s and 1s some models won't recognize them as categorical features and will return errors.  
+
+```{r}
+data$satisfaction <- as.factor(data$satisfaction)
+```
+Let's have a look at the result: all categorical features have successfully been encoded. 
+```{r}
+tibble::glimpse(data)
+```
+
+## Numerical features 
+
+The skew and long-tail of the distribution of the numerical features that we observed in the previous section may cause problems in the parametric models, such as logistic regression. However, thanks to the nature of the tree-based models, we can simply leave them as they are, and proceed to the modeling part. 
+
+# Modeling 
+
+Having done the preliminary data processing, we are ready to split the dataset in to training set `train_data` and testing set `test_data`. We choose the 80:20 ratio and set the seed for reproducibility purpose.
+
+```{r}
+## Data Splitting
+
+# for reproducibility 
+set.seed(123)
+
+# data splitting
+index <- sample(1:nrow(data), round(nrow(data) * 0.8))
+train_data <- data[index, ]
+test_data <- data[-index, ]
+```
+
+The proportion of each class in both the training set and test set are similar and balanced:
+
+```{r}
+# check the proportion of each set
+prop.table(table(train_data$satisfaction))
+prop.table(table(test_data$satisfaction))
+```
+The dimension of the training set as well as the test set:
+```{r}
+dim(train_data)
+dim(test_data)
+```
+
+## Decision Tree
+
+Decision tree is a nonparamatric algorithm that is built on the basis of divide-and-conquer concept. The algorithm explores the feature space and divide the features into a subset of smaller feature spaces based on certain criteria. Specifically, in the case of classification decision tree, the algorithm divides the dataset into two regions which results in the minimal Gini index, then, the algorithm splits these two regions into four smaller regions which again, have the minimal Gini index, the splitting process repeats until the stopping criteria, e.g. maximum depth is reached. In short, by ansewering a sequence of yes-or-no question, the algorithm will eventually provide the classification result of a given observation. 
+
+Decision trees provide a very intuitive way of visualizing the result. Although its predictive power is not comparable to the more complex algorithms, namely random forest, neural networks, etc. its interpretability makes it stand out. 
+
+We use the library `rpart` to implement the decision tree algorithm. We start with the most basic tree using only the default settings of `rpart()`, no other parameters are specified.
+
+```{r}
+# a basic tree
+model_dt1 <- rpart(
+  formula = satisfaction ~ .,
+  data = train_data, 
+  method = "class"
+)
+```
+
+The basic tree `model_dt` can be visualized in the following figure. At the top level, the root node, 44% of the customers are satisfied with the service. The node asks whether the customer rated `Online_boarding` less than four, and subsequently divides the entire `100%` dataset into equal halves: 50% having `Online_boarding < 4` and 50% having `Online_boarding >= 4`. 
+
+Moving on along the right branch, for the half who have voted no (`Online_boarding >= 4`), the probability of them being satisfied with the overall service is 72%. The node then asks if the customer is on a business travel (`Type_of_Travel` = 1), if yes, then the probability of the customer being satisfied with the overall service is 85%. 40% of the overall customers are determined through this route.  
+
+```{r}
+# visualize the basic tree model 
+rpart.plot(model_dt1, yesno = 2)
+```
+The feature importance is as follows:
+
+```{r}
+# feature importance
+vip::vip(model_dt1, num_features = 23) + my_theme()
+```
+
+
+Let's check the predictive power of the basic tree on the test set
+
+```{r}
+# prediction
+dt1_pred <- predict(model_dt1, test_data, type = 'class')
+
+# confusion matrix 
+cm_dt1 <- confusionMatrix(as.factor(dt1_pred), as.factor(test_data$satisfaction))
+
+# result
+cm_dt1$table # confusion matrix 
+cm_dt1$overall # accuracy ~ 88.o%
+
+```
+
+The basic tree scores an Accuracy at 88.95%, given that the dependent variable is balanced, the result is quite good. The confusion matrix shows that the model correctly predicted 4607 (2474 + 2133) observations, 369 false positive cases and 203 false negatives. 
+
+The basic tree has already received a good result. Let's see if we can improve the result using model tuning. 
+
+### Model Tuning
+
+#### Cost of complexity 
+
+From the above tree diagram, we observe that only three features are used for prediction, such as `Online_boarding`, `Inflight_wifi_service`, `Type_of_Travel`, this is because `rpart()` automatically prune the tree behind the scene by adjusting the complexity parameter (cp). The following figure illustrates the changes of the relative cross validation error in response to the cp value. At around the tree size of 6, we would be able to achieve the optimal value. 
+
+```{r}
+plotcp(model_dt1)
+```
+Alternatively, we are able to obtain the optimal cp value from the model result using `model_dt1$cptable`:
+
+```{r}
+# Retrieve optimal cp value based on cross-validated error
+opt_index <- which.min(model_dt1$cptable[, "xerror"])
+cp_opt <- model_dt1$cptable[opt_index, "CP"]
+cp_opt
+```
+Having found the optimal cp value, we use grid search to find the optimal splits and depths. 
+
+#### Grid search 
+
+```{r}
+# fine tuning - grid search 
+
+splits <- seq(1, 15, 2)
+depths <- seq(1, 30, 4)
+
+grid_dt1 <- expand.grid(
+  minsplit = splits,
+  maxdepth = depths
+)
+```
+
+
+```{r}
+models <- c()
+accu_score <- c()
+
+# start grid search
+for (i in 1:nrow(grid_dt1)) {
+  minsplit <- grid_dt1$minsplit[i]
+  maxdepth <- grid_dt1$maxdepth[i]
+  
+  models[[i]] <- rpart(
+    formula = satisfaction ~ .,
+    data = train_data,
+    method = "class",
+    minsplit = minsplit,
+    maxdepth = maxdepth,
+    control = list(cp = cp_opt)
+  )
+}
+
+for (i in 1:length(models)) {
+  model <- models[[i]]
+  
+  pred <- predict(object = model,
+                  newdata = test_data,
+                  type = "class")
+  
+  accu_score[i] <- mean(pred == test_data$satisfaction)
+}
+
+```
+
+```{r}
+# select the optimal model based on grid search
+mod_dt_index <- which.max(accu_score)
+mod_gs_opt <- models[[mod_dt_index]]
+```
+
+```{r}
+# ROC for the basic tree model
+roc_dt1_train <- prediction(
+  predict(model_dt1, type = "prob")[, 2], 
+  train_data$satisfaction)
+
+roc_dt1_test <- prediction(
+  predict(model_dt1, newdata = test_data, type = "prob")[, 2],
+   test_data$satisfaction) 
+
+plot(performance(roc_dt1_train, "tpr", "fpr"),  col = "blue", main = "ROC")
+plot(performance(roc_dt1_test, "tpr", "fpr"),  col = "blue", lty = "dashed", add=TRUE)
+
+# AUC for the basic tree model 
+auc_dt1_train <- performance(roc_dt1_train, "auc")
+auc_dt1_test  <- performance(roc_dt1_test, "auc")
+
+auc_dt1_train@y.values 
+auc_dt1_test@y.values 
+```
+
+```{r}
+# ROC for the optimal model found via grid search 
+roc_gs_train <- prediction(
+  predict(mod_gs_opt, type = "prob")[, 2], 
+  train_data$satisfaction)
+
+roc_gs_test <- prediction(
+  predict(mod_gs_opt, newdata = test_data, type = "prob")[, 2],
+   test_data$satisfaction) 
+
+plot(performance(roc_gs_train, "tpr", "fpr"),  col = "gray", main = "ROC")
+plot(performance(roc_gs_test, "tpr", "fpr"),  col = "gray", lty = "dashed", add=TRUE)
+plot(performance(roc_dt1_train, "tpr", "fpr"),  col = "blue", add=TRUE)
+plot(performance(roc_dt1_test, "tpr", "fpr"),  col = "blue", lty = "dashed", add=TRUE)
+
+# AUC for the optimal model found via grid search 
+auc_gs_train <- performance(roc_gs_train, "auc")
+auc_gs_test  <- performance(roc_gs_test, "auc")
+
+auc_gs_train@y.values 
+auc_gs_test@y.values 
+```
+
+The AUC value of the basic decision tree is 0.9028184 and 0.9062647 for the training set and test set, respectively, which is the same for the optimal model found via grid search. Such result is foreseeable as the improvement in the accuracy score is negligible (0.889553967 vs. 0.8895540) - which happens mostly due to the rounding. Therefore, we stick to the basic tree. 
+
+#### K-fold cross validation 
+
+Next, we use repeated k-fold cross validation for fine tuning. We set the parameters k = 5 and repeat 3 times: 
+
+```{r}
+# k-fold cross validation 
+
+# Set up caret to perform 5-fold cross validation repeated 3 times
+
+model_dt_cv <- train(
+  satisfaction ~ .,
+  data = train_data,
+  method = "rpart",
+  trControl = trainControl(
+    method = "repeatedcv",
+    number = 5,
+    repeats = 3
+  ),
+  tuneLength = 15
+)
+```
+
+
+```{r}
+# predict on the test set 
+dt_cv_pred <- predict(object = model_dt_cv,
+                      newdata = test_data,
+                      type = "raw")
+```
+
+```{r}
+# confusion matrix 
+cm_dt_cv <- confusionMatrix(as.factor(dt_cv_pred), as.factor(test_data$satisfaction))
+
+cm_dt_cv$table
+
+cm_dt_cv$overall # 0.92179958
+```
+
+The accuracy score increased to 92.62%, as reported by the confusion matrix, we see a significant reduction in false positive (369 to 155) and a slight increase in false negatives (203 to 227).
+
+```{r}
+roc_dtcv_train <- prediction(
+  predict(model_dt_cv, type = "prob")[, 2], 
+  train_data$satisfaction)
+
+roc_dtcv_test <- prediction(
+  predict(model_dt_cv, newdata = test_data, type = "prob")[, 2],
+   test_data$satisfaction) 
+
+plot(performance(roc_dtcv_train, "tpr", "fpr"),  col = "red", main = "ROC")
+plot(performance(roc_dtcv_test, "tpr", "fpr"),  col = "red", lty = "dashed", add=TRUE)
+plot(performance(roc_dt1_train, "tpr", "fpr"),  col = "blue", add=TRUE)
+plot(performance(roc_dt1_test, "tpr", "fpr"),  col = "blue", lty = "dashed", add=TRUE)
+```
+The model performance in term of the ROC curve and AUC scores have both improved. From the ROC plot, the optimal model out-performs the basic decision tree at every level; the AUC scores have reached 0.9658434 and 0.9616846 for the training and test set, respectively.
+
+```{r}
+# AUC 
+auc_dtcv_train <- performance(roc_dtcv_train, "auc")
+auc_dtcv_test  <- performance(roc_dtcv_test, "auc")
+
+auc_dtcv_train@y.values 
+auc_dtcv_test@y.values 
+```
+
+```{r}
+# visualize the optimal tree model
+dt_cv_opt <- model_dt_cv$finalModel
+rpart.plot(dt_cv_opt, yesno = 2)
+```
+```{r}
+dt_cv_opt
+```
+
+We can see that the optimal model is much more complex than the basic decision tree model: having more depths and using more variables. 
+
+From the feature importance plot, we observe that more features are included, and the importance of the two most influential features `Online_boarding` and `Inflight_wifi_service` have increase in the optimal model. 
+
+```{r}
+# feature importance
+vip::vip(dt_cv_opt, num_features = 23) + my_theme()
+```
+## Random Forest
+
+Decision tree is the most basic element of the tree-based algorithms family, the more complex algorithms, such as random forest, is an _ensemble_ of decision trees. The idea of random forest is built on the concept of _the power of large numbers_: decision trees are aggregated into groups, and each group is trained on a random subset of the data, then whichever has the highest predictive power is selected to make the final prediction. The random subset of the data is drawn typically via bagging method (sampling with replacement), so that some observations may be used a few times for training. The downside of the random forest is its interpretability. 
+
+First, we build a simple random forest with default settings:
+
+```{r}
+# random forest with basic setting
+model_rf <- randomForest(satisfaction ~ .,
+                         data = train_data)
+```
+
+Without tuning, we compare the performance of the basic random forest model with the basic decision tree (blue) and optimal decision tree (red). 
+
+
+```{r}
+roc_rf_train <- prediction(
+  predict(model_rf, type = "prob")[, 2], 
+  train_data$satisfaction)
+
+roc_rf_test <- prediction(
+  predict(model_rf, newdata = test_data, type = "prob")[, 2],
+   test_data$satisfaction) 
+
+plot(performance(roc_rf_train, "tpr", "fpr"),  col = "green", main = "ROC")
+plot(performance(roc_rf_test, "tpr", "fpr"),  col = "green", lty = "dashed", add = TRUE)
+plot(performance(roc_dtcv_train, "tpr", "fpr"),  col = "red", add = TRUE)
+plot(performance(roc_dtcv_test, "tpr", "fpr"),  col = "red", lty = "dashed", add = TRUE)
+plot(performance(roc_dt1_train, "tpr", "fpr"),  col = "blue", add=TRUE)
+plot(performance(roc_dt1_test, "tpr", "fpr"),  col = "blue", lty = "dashed", add = TRUE)
+```
+The random forest model has shown its supremacy: the ROC curve has outperformed the best-tuned decision tree model, and the AUC score of the random forest model has exceeded 99%: reaching 99.166% for the training set and 99.18964% for the test set. 
+
+```{r}
+# AUC 
+auc_rf_train <- performance(roc_rf_train, "auc")
+auc_rf_test  <- performance(roc_rf_test, "auc")
+
+auc_rf_train@y.values 
+auc_rf_test@y.values 
+```
+
+The overall accuracy reached 95.29% and the confusion matrix reported a drastic decrease in both false positive (down to 91) and false negatives (down to 153). 
+
+```{r}
+# prediction
+rf_pred <- predict(model_rf, test_data, type = 'class')
+
+# confusion matrix 
+cm_rf <- confusionMatrix(as.factor(rf_pred),
+                          as.factor(test_data$satisfaction))
+
+# result
+cm_rf$table # confusion matrix 
+cm_rf$overall # accuracy ~ 95%
+```
+
+`Online_boarding` and `Inflight_wifi_service` remain the two most influential features, followed by `Type_of_Travel` and `Class`, `Gender` becomes least influential in the random forest model and most notably, features concerning the delay `Arrival_Delay_in_Minutes` and `Departure_Delay_in_Minutes` have gained influences. 
+
+```{r}
+vip::vip(model_rf, num_features = 23) + 
+  my_theme()
+```
+
+## Model Interpretability
+
+Feature importance only gives us only the global relationship between features of the explained variable of a model, which is often not sufficient if the model is to be implemented in practice, as the local interpretations in terms of how a single observation is rejected or accepted remains unclear. Complex algorithms, including random forest, neural networks, are deemed as black-box due to their lack of local interpretability. In view of this, researchers have developed algorithms such as Local interpretable model-agnostic explanations(LIME) and Shapley values attempting to address this issue. In this section, we briefly touch on the Shapley values and its interpretability.
+
+First, we filter out all the mis-classifications by the random forest model. There are total 244 misclassfications including false positives and false negatives.
+
+```{r}
+# store all misclassifications
+mis_clf <- test_data[rf_pred != test_data$satisfaction,]
+```
+
+Then, we use the R wrapper of the python library `shap` (`shapper`) to explain how the first observation in the mis-classications `mis_clf[1,]` is predicted. 
+
+```{r, message=FALSE, warning=FALSE}
+p_function <-
+  function(model, data)
+    predict(model, newdata = data, type = "prob")
+
+ive_rf <-
+  individual_variable_effect(
+    model_rf,
+    data = train_data,
+    predict_function = p_function,
+    new_observation =  mis_clf[1,],
+    nsamples = 50
+  )
+
+ive_rf_filtered <- dplyr::filter(ive_rf, `_ylevel_` == "satisfied")
+shapper:::plot.individual_variable_effect(ive_rf_filtered)
+```
+
+From the above Shapley plot, we learn that the random forest model `model_rf` predicted that the given observation has 56% probability to be `satisified`, the majority of the confidence comes from the `Online_boarding` feature, which the observation has a value of 5. Although most of the remaining features have negative influences on the final prediction, they are not enough to cancel out the positive influence by `Online_boarding`.
+
+  
+# Conclusion 
+
+```{r}
+col_b = "#1d3557"
+col_r = "#d62828"
+col_g = "#2a9d8f"
+col_i = "#264653"
+
+# ROC for the logistic regression 
+plot(performance(pred_lr_train, "tpr", "fpr"),  col = "gray", main = "ROC")
+plot(performance(pred_lr_test, "tpr", "fpr"),  col = "gray", lty = "dashed", add=TRUE)
+plot(performance(roc_rf_train, "tpr", "fpr"),  col = "green",  add=TRUE)
+plot(performance(roc_rf_test, "tpr", "fpr"),  col = "green", lty = "dashed", add = TRUE)
+plot(performance(roc_dtcv_train, "tpr", "fpr"),  col = "red", add = TRUE)
+plot(performance(roc_dtcv_test, "tpr", "fpr"),  col = "red", lty = "dashed", add = TRUE)
+plot(performance(roc_dt1_train, "tpr", "fpr"),  col = "blue", add=TRUE)
+plot(performance(roc_dt1_test, "tpr", "fpr"),  col = "blue", lty = "dashed", add = TRUE)
+legend(0.6, 0.6, legend=c("LR train", "LR test", "RF train", "RF test", 
+                          "DT opt train", "DT opt test", "DT train", "DT test"),
+       col=c("gray", "gray", "green", "green", "red", "red", "blue", "blue"), lty=1:2, cex=0.8)
+```
+
+
+```{r}
+# combine the results 
+models <- c("logistic regression", "basic decision tree", "optimal decision tree", "random forest")
+train_aucs <- unlist(c(auc_train, auc_dt1_train@y.values, auc_dtcv_train@y.values, auc_rf_train@y.values))
+test_aucs <- unlist(c(auc_test, auc_dt1_test@y.values, auc_dtcv_test@y.values, auc_rf_test@y.values))
+
+auc_overall <- data.frame(models, train_aucs, test_aucs)
+colnames(auc_overall) <- c("models", "train_aucs", "test_aucs")
+
+datatable(auc_overall) %>% formatRound(c(2,3), 5)
+```
+Overall, the logistic regression method has a comparable performance with the optimal decision tree model, outperforms the basic decision tree model in terms of the ROC curve but has a weaker predictive power as compared with the random forest model. The random forest model has the best performance even with the default settings, however, its interpretability remains a major hindrance to be deployed in production. 
