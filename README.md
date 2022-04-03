@@ -4,7 +4,7 @@ Dataset: https://www.kaggle.com/teejmahal20/airline-passenger-satisfaction
 
 - Part I: Credit Scoring using WOE
     - Fine classing & calculate WOE
-    - Coarse classing % calculate WOE
+    - Coarse classing & calculate WOE
     - Logistic Regression
     - Quality Assessment
 
@@ -20,6 +20,7 @@ distribution of the scores cared [1: defaulted / 0: not defaulted]
 - Part III: Model Comparison
 - 
 ![](img/result.png)
+
 
 |      |   models                 |   train_aucs  |   test_aucs  |
 |------|--------------------------|---------------|--------------|
