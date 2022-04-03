@@ -1,4 +1,4 @@
-# Credit-Risk-Modeling-Project
+# Credit Risk Modeling Using WOE
 
 Dataset: https://www.kaggle.com/teejmahal20/airline-passenger-satisfaction
 
