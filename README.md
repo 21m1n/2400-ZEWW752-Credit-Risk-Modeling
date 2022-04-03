@@ -18,7 +18,7 @@ distribution of the scores cared [1: defaulted / 0: not defaulted]
   - model interpretability using SHAP
 
 - Part III: Model Comparison
-- 
+
 ![](img/result.png)
 
 
