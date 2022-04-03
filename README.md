@@ -8,7 +8,7 @@ Dataset: https://www.kaggle.com/teejmahal20/airline-passenger-satisfaction
     - Logistic Regression
     - Quality Assessment
 
-distribution of the scores cared [1: defaulted / 0: not defaulted]
+distribution of the scores card [1: defaulted / 0: not defaulted]
 
 ![](img/score\_dist.png)
     
